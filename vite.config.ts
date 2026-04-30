@@ -118,6 +118,12 @@ const SESSION_COOKIE = "image_studio_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
 const ADMIN_STORE_PATH = join(DATA_DIR, "admin-store.json");
+const FRONTEND_BUILD_VERSION = process.env.FRONTEND_BUILD_VERSION ||
+  new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+const FRONTEND_BUILD_INFO = {
+  version: FRONTEND_BUILD_VERSION,
+  builtAt: new Date().toISOString(),
+};
 
 const adminSessions = new Map<string, { username: string; expiresAt: number }>();
 
@@ -1220,8 +1226,41 @@ function imageProxyPlugin(): PluginOption {
   };
 }
 
+function frontendVersionPlugin(): PluginOption {
+  return {
+    name: "frontend-build-version",
+    configureServer(server: ViteDevServer) {
+      server.middlewares.use("/build-version.json", (_req, res) => {
+        res.statusCode = 200;
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache, max-age=0, must-revalidate");
+        res.end(JSON.stringify(FRONTEND_BUILD_INFO));
+      });
+    },
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "build-version.json",
+        source: JSON.stringify(FRONTEND_BUILD_INFO, null, 2),
+      });
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [react(), imageProxyPlugin()],
+  plugins: [react(), imageProxyPlugin(), frontendVersionPlugin()],
+  define: {
+    __FRONTEND_BUILD_VERSION__: JSON.stringify(FRONTEND_BUILD_VERSION),
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        entryFileNames: `assets/[name]-[hash]-v${FRONTEND_BUILD_VERSION}.js`,
+        chunkFileNames: `assets/[name]-[hash]-v${FRONTEND_BUILD_VERSION}.js`,
+        assetFileNames: `assets/[name]-[hash]-v${FRONTEND_BUILD_VERSION}[extname]`,
+      },
+    },
+  },
   server: {
     host: "0.0.0.0",
     port: 8877,

@@ -1027,6 +1027,45 @@ textarea:focus-visible {
   color: var(--green);
 }
 
+.version-update-notice {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  z-index: 80;
+  display: flex;
+  max-width: min(560px, calc(100vw - 24px));
+  align-items: center;
+  gap: 9px;
+  padding: 9px 10px 9px 13px;
+  border: 1px solid #b8ded2;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.96);
+  box-shadow: 0 18px 48px rgba(17, 17, 17, 0.14);
+  color: var(--text);
+  transform: translateX(-50%);
+  backdrop-filter: blur(14px);
+  animation: prompt-presets-in 180ms ease-out both;
+}
+
+.version-update-notice div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.version-update-notice strong {
+  font-size: 13px;
+  font-weight: 820;
+}
+
+.version-update-notice span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .canvas {
   width: 100%;
   max-width: 100%;
@@ -2417,6 +2456,7 @@ textarea:focus-visible {
   .send-button.is-launching .send-button__trail,
   .prompt-presets-panel,
   .prompt-analysis-panel,
+  .version-update-notice,
   .composer.is-analyzing .composer-main::after,
   .prompt-analysis-panel.analyzing .analysis-orb,
   .analysis-scan span,
@@ -3313,6 +3353,21 @@ textarea:focus-visible {
   .topbar {
     align-items: center;
     padding: 10px 12px;
+  }
+
+  .version-update-notice {
+    top: 10px;
+    align-items: stretch;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .version-update-notice div {
+    flex: 1 1 100%;
+  }
+
+  .version-update-notice span {
+    white-space: normal;
   }
 
   .current-model {

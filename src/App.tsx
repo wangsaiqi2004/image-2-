@@ -274,6 +274,10 @@ const MAX_REFERENCE_SIZE = 10 * 1024 * 1024;
 const MIN_REFERENCE_EDGE = 128;
 const LARGE_REFERENCE_EDGE = 4096;
 const PROMPT_TEXTAREA_MAX_HEIGHT = 220;
+const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
+  ? __FRONTEND_BUILD_VERSION__
+  : "dev";
 const ALLOWED_API_ENDPOINTS = [
   {
     value: "https://www.taijiai.online/",
@@ -1141,6 +1145,22 @@ function serializeError(detail: ErrorDetail) {
   }
 }
 
+async function fetchFrontendBuildVersion(signal?: AbortSignal) {
+  const response = await fetch(`/build-version.json?t=${Date.now()}`, {
+    cache: "no-store",
+    signal,
+  });
+  if (!response.ok) throw new Error(`版本检查失败：HTTP ${response.status}`);
+  const payload = await response.json() as { version?: unknown };
+  return typeof payload.version === "string" ? payload.version : "";
+}
+
+function reloadWithFrontendVersion(version: string) {
+  const nextUrl = new URL(window.location.href);
+  nextUrl.searchParams.set("app_v", version);
+  window.location.assign(nextUrl.toString());
+}
+
 function loadBooleanSetting(key: string, fallback: boolean) {
   const raw = localStorage.getItem(key);
   if (raw === "true") return true;
@@ -1606,6 +1626,7 @@ export default function App() {
     message: "",
   });
   const [analysisStepIndex, setAnalysisStepIndex] = useState(0);
+  const [availableFrontendVersion, setAvailableFrontendVersion] = useState("");
   const [now, setNow] = useState(Date.now());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1732,6 +1753,35 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("imageStudioSelectedAnalysisModel", selectedAnalysisModel);
   }, [selectedAnalysisModel]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    let stopped = false;
+    const checkVersion = async () => {
+      try {
+        const latestVersion = await fetchFrontendBuildVersion(controller.signal);
+        if (!stopped && latestVersion && latestVersion !== CURRENT_FRONTEND_VERSION) {
+          setAvailableFrontendVersion(latestVersion);
+        }
+      } catch {
+        // Version checks are best-effort and should never interrupt creation.
+      }
+    };
+    void checkVersion();
+    const interval = window.setInterval(() => void checkVersion(), FRONTEND_VERSION_CHECK_INTERVAL_MS);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") void checkVersion();
+    };
+    window.addEventListener("focus", checkVersion);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      stopped = true;
+      controller.abort();
+      window.clearInterval(interval);
+      window.removeEventListener("focus", checkVersion);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, []);
 
   useLayoutEffect(() => {
     resizePromptTextarea();
@@ -2699,16 +2749,35 @@ export default function App() {
   const analysisSourceLabel = analysisResult?.source === "ai"
     ? `AI · ${analysisResult.analysisModel || preferredAnalysisModel}`
     : analysisResult?.analysisModel || "本地预检";
+  const frontendUpdateNotice = availableFrontendVersion ? (
+    <FrontendUpdateNotice
+      version={availableFrontendVersion}
+      onRefresh={() => reloadWithFrontendVersion(availableFrontendVersion)}
+      onDismiss={() => setAvailableFrontendVersion("")}
+    />
+  ) : null;
 
   if (activePage === "home") {
-    return <HomePage onEnter={enterStudio} onAdmin={enterAdmin} />;
+    return (
+      <>
+        {frontendUpdateNotice}
+        <HomePage onEnter={enterStudio} onAdmin={enterAdmin} />
+      </>
+    );
   }
 
   if (activePage === "admin") {
-    return <AdminApp onBackHome={returnHome} onEnterStudio={enterStudio} />;
+    return (
+      <>
+        {frontendUpdateNotice}
+        <AdminApp onBackHome={returnHome} onEnterStudio={enterStudio} />
+      </>
+    );
   }
 
   return (
+    <>
+    {frontendUpdateNotice}
     <div className={`app-shell ${isLeftSidebarOpen ? "left-open" : "left-closed"} ${isSettingsOpen ? "settings-open" : "settings-closed"}`}>
       <button
         className="drawer-backdrop"
@@ -3476,6 +3545,7 @@ export default function App() {
         />
       )}
     </div>
+    </>
   );
 }
 
@@ -4276,6 +4346,32 @@ function SidebarToggleButton({
     <button type="button" className="topbar-toggle" title={title} onClick={onClick} aria-pressed={open}>
       <Icon size={18} />
     </button>
+  );
+}
+
+function FrontendUpdateNotice({
+  version,
+  onRefresh,
+  onDismiss,
+}: {
+  version: string;
+  onRefresh: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="version-update-notice" role="status" aria-live="polite">
+      <div>
+        <strong>新版本可用</strong>
+        <span>检测到前端版本 v{version}，刷新后会加载最新样式和脚本。</span>
+      </div>
+      <button type="button" className="primary-action compact" onClick={onRefresh}>
+        <RefreshCw size={15} />
+        刷新
+      </button>
+      <button type="button" className="icon-button" title="稍后提醒" onClick={onDismiss}>
+        <X size={15} />
+      </button>
+    </div>
   );
 }
 
