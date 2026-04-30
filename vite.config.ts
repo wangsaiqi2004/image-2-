@@ -502,6 +502,139 @@ function collectText(node: unknown, found: string[] = []) {
   return found;
 }
 
+function extractJsonObject(text: string) {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) return trimmed;
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  if (fenced?.startsWith("{")) return fenced;
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  return start >= 0 && end > start ? trimmed.slice(start, end + 1) : trimmed;
+}
+
+function normalizeRiskLevel(value: unknown) {
+  return value === "high" || value === "medium" || value === "low" ? value : "low";
+}
+
+function normalizeAnalysisPayload(value: unknown, analysisModel: string) {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const risks = Array.isArray(record.risks)
+    ? record.risks
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+      .map((risk) => ({
+        level: normalizeRiskLevel(risk.level),
+        title: typeof risk.title === "string" ? risk.title : "生成风险",
+        description: typeof risk.description === "string" ? risk.description : "",
+        fix: typeof risk.fix === "string" ? risk.fix : undefined,
+      }))
+    : [];
+  const riskLevel = normalizeRiskLevel(record.riskLevel || (risks.some((risk) => risk.level === "high") ? "high" : risks.some((risk) => risk.level === "medium") ? "medium" : "low"));
+  const suggestedParams = record.suggestedParams && typeof record.suggestedParams === "object"
+    ? record.suggestedParams as Record<string, unknown>
+    : {};
+  const styleStrength = suggestedParams.styleStrength;
+  const referenceWeight = suggestedParams.referenceWeight;
+  const styleEnhancements = Array.isArray(record.styleEnhancements)
+    ? record.styleEnhancements
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+      .map((item) => ({
+        name: typeof item.name === "string" ? item.name : "",
+        description: typeof item.description === "string" ? item.description : "",
+        promptFragment: typeof item.promptFragment === "string" ? item.promptFragment : "",
+      }))
+      .filter((item) => item.name && item.promptFragment)
+    : [];
+  return {
+    safe: typeof record.safe === "boolean" ? record.safe : riskLevel !== "high",
+    score: typeof record.score === "number" ? Math.max(0, Math.min(100, record.score)) : riskLevel === "low" ? 92 : riskLevel === "medium" ? 74 : 48,
+    riskLevel,
+    summary: typeof record.summary === "string" ? record.summary : "已完成发送前分析。",
+    optimizedPrompt: typeof record.optimizedPrompt === "string" ? record.optimizedPrompt : "",
+    suggestedNegativePrompt: typeof record.suggestedNegativePrompt === "string" ? record.suggestedNegativePrompt : "",
+    suggestedParams: {
+      aspectRatio: typeof suggestedParams.aspectRatio === "string" ? suggestedParams.aspectRatio : undefined,
+      size: typeof suggestedParams.size === "string" ? suggestedParams.size : undefined,
+      count: typeof suggestedParams.count === "number" ? suggestedParams.count : undefined,
+      quality: typeof suggestedParams.quality === "string" ? suggestedParams.quality : undefined,
+      styleStrength: styleStrength === "low" || styleStrength === "medium" || styleStrength === "high"
+        ? styleStrength
+        : undefined,
+      referenceWeight: referenceWeight === "low" || referenceWeight === "medium" || referenceWeight === "high"
+        ? referenceWeight
+        : undefined,
+    },
+    risks,
+    styleEnhancements,
+    analysisModel,
+    source: "ai",
+  };
+}
+
+async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: ProxyBody) {
+  const analysisModel = getString(body, "analysisModel");
+  const prompt = getString(body, "prompt");
+  if (!analysisModel) throw new Error("分析模型不能为空");
+  if (!prompt) throw new Error("提示词不能为空");
+  if (!apiKey) throw new Error("API Key 不能为空");
+
+  const context = {
+    prompt,
+    negativePrompt: getString(body, "negativePrompt"),
+    protocol: getString(body, "protocol"),
+    imageModel: getString(body, "imageModel"),
+    aspectRatio: getString(body, "aspectRatio"),
+    size: getString(body, "size"),
+    quality: getString(body, "quality"),
+    outputFormat: getString(body, "outputFormat"),
+    count: getNumber(body.count),
+    concurrency: getNumber(body.concurrency),
+    referenceCount: getNumber(body.referenceCount) || 0,
+    referenceIssues: Array.isArray(body.referenceIssues) ? body.referenceIssues : [],
+    mode: getString(body, "mode") || "send",
+  };
+  const systemPrompt = [
+    "你是一个专业的 GPT 生图发送前分析器。",
+    "你的任务是判断提示词是否适合进入生图流程，并给出提示词优化、参数推荐、失败预判和风格增强。",
+    "只返回 JSON，不要使用 Markdown。",
+    "JSON 字段必须包含 safe, score, riskLevel, summary, optimizedPrompt, suggestedNegativePrompt, suggestedParams, risks, styleEnhancements。",
+    "riskLevel 只能是 low、medium、high。safe=false 仅用于高风险或大概率失败场景。",
+    "suggestedParams 可包含 aspectRatio, size, count, quality, styleStrength, referenceWeight。",
+    "risks 每项包含 level, title, description, fix。styleEnhancements 每项包含 name, description, promptFragment。",
+    "优化提示词时要保留用户原意，不要替换主体，不要加入未授权的具体人物身份。",
+  ].join("\n");
+
+  const response = await fetchWithTimeout(endpoint(baseUrl, "/v1/chat/completions"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: analysisModel,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: JSON.stringify(context, null, 2) },
+      ],
+      temperature: 0.2,
+      response_format: { type: "json_object" },
+    }),
+  }, 90_000);
+  const text = await response.text();
+  if (!response.ok) throw detailFromUpstream(response.status, text);
+  const payload = parseMaybeJson(text);
+  const choices = payload && typeof payload === "object" && Array.isArray((payload as { choices?: unknown }).choices)
+    ? (payload as { choices: Array<Record<string, unknown>> }).choices
+    : [];
+  const message = choices[0]?.message;
+  const content = message && typeof message === "object" ? (message as Record<string, unknown>).content : "";
+  const rawContent = typeof content === "string" ? content : JSON.stringify(content || {});
+  const analysis = parseMaybeJson(extractJsonObject(rawContent));
+  if (!analysis || typeof analysis !== "object") {
+    throw new Error("分析模型没有返回可解析的 JSON");
+  }
+  return normalizeAnalysisPayload(analysis, analysisModel);
+}
+
 async function readOpenAiImageResponse(response: Response, outputFormat: string) {
   const bodyText = await response.text();
   if (!response.ok) {
@@ -938,6 +1071,27 @@ function imageProxyPlugin(): PluginOption {
           sendJson(res, 200, { ok: true, models: [...new Set(models)].sort(), raw });
         } catch (error) {
           sendJson(res, 500, { ok: false, detail: { error: error instanceof Error ? error.message : String(error) } });
+        }
+      });
+
+      server.middlewares.use("/api/prompt/analyze", async (req, res) => {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        try {
+          const body = await readJsonBody(req);
+          const baseUrl = getString(body, "baseUrl");
+          const apiKey = getString(body, "apiKey");
+          const analysis = await analyzePromptWithGpt(baseUrl, apiKey, body);
+          sendJson(res, 200, { ok: true, analysis });
+        } catch (error) {
+          sendJson(res, 500, {
+            ok: false,
+            detail: error && typeof error === "object" && "error" in error
+              ? error
+              : { error: error instanceof Error ? error.message : String(error) },
+          });
         }
       });
 

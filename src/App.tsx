@@ -33,7 +33,6 @@ import {
   type ChangeEvent,
   type DragEvent,
   type FormEvent,
-  type PointerEvent as ReactPointerEvent,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -150,6 +149,53 @@ type GenerateProxyResponse = {
   images?: Array<{ dataUrl: string; revisedPrompt?: string }>;
   detail?: unknown;
   raw?: unknown;
+};
+
+type AnalysisMode = "send" | "optimize" | "params" | "risk" | "style";
+type RiskLevel = "low" | "medium" | "high";
+
+type SuggestedParams = {
+  aspectRatio?: string;
+  size?: string;
+  count?: number;
+  quality?: string;
+  styleStrength?: "low" | "medium" | "high";
+  referenceWeight?: "low" | "medium" | "high";
+};
+
+type PromptRisk = {
+  level: RiskLevel;
+  title: string;
+  description: string;
+  fix?: string;
+};
+
+type StyleEnhancement = {
+  name: string;
+  description: string;
+  promptFragment: string;
+};
+
+type PromptAnalysisResult = {
+  safe: boolean;
+  score: number;
+  riskLevel: RiskLevel;
+  summary: string;
+  optimizedPrompt: string;
+  suggestedNegativePrompt?: string;
+  suggestedParams: SuggestedParams;
+  risks: PromptRisk[];
+  styleEnhancements: StyleEnhancement[];
+  analysisModel?: string;
+  source?: "ai" | "local";
+};
+
+type PromptAnalysisState = {
+  status: "idle" | "analyzing" | "ready" | "error";
+  mode: AnalysisMode;
+  message: string;
+  result?: PromptAnalysisResult;
+  error?: string;
 };
 
 type PreviewItem = {
@@ -394,24 +440,85 @@ const PROTOCOLS: Array<{
 
 const PROMPT_STARTERS = [
   {
-    label: "场景图",
-    prompt: "雨后的城市街角，玻璃橱窗反射霓虹与车灯，电影感自然光，真实摄影，细节丰富",
+    label: "超写实人像",
+    tag: "头像写真",
+    prompt: "8K 超写实近景人像肖像，女性，白皙皮肤，五官与参考照片 100% 一致，柔和侧逆光打在脸上，背景虚化，皮肤纹理与毛发细节清晰可见，电影级光影和肤色过渡，高质感摄影棚风格，4K 细节，适合头像与人像写真展示。",
   },
   {
-    label: "产品图",
-    prompt: "一款极简黑色智能音箱放在浅灰色桌面上，柔和棚拍光，高级商业摄影，干净背景",
+    label: "水墨双龙",
+    tag: "东方概念",
+    prompt: "阴阳概念，两条中国龙龙对战，一条白龙一条黑龙，极简水墨画风格，黑色墨迹绘制在白色背景上，带有和纸纹理，大号红色印章签名，禅意风格，居中构图",
   },
   {
-    label: "海报",
-    prompt: "未来科技发布会主视觉，发光的数字地球悬浮在深色舞台中央，强烈空间层次，高清海报",
+    label: "建筑文字剖面",
+    tag: "信息图",
+    prompt: "2x2 网格布局，每一格是一栋著名建筑的垂直剖面示意图，不画真实造型，而是用建筑结构与材料术语堆叠成楼层文字方块：地基、柱网、楼板、幕墙、机电系统等，从下到上依次排列。整体采用极简信息图风格，白底黑字，少量线条勾勒楼层分隔，排版干净、对比清晰，可读性强，适合作为建筑结构可视化概念插画。",
   },
   {
-    label: "室内",
-    prompt: "清晨阳光洒进现代客厅，亚麻沙发、木质地板、绿植，温暖安静的生活方式摄影",
+    label: "蓝图到现实",
+    tag: "建筑渲染",
+    prompt: "创建一张纵向分屏建筑可视化图，上半部分是深色主题的精细建筑平立面蓝图，包含清晰线稿、标注和结构细节，下半部分是与蓝图完全对应的写实现代住宅外观 3D 渲染，真实光影和材质，干净背景，整体呈现“蓝图到现实”的一体化对比效果。",
   },
   {
-    label: "人物",
-    prompt: "半身肖像摄影，柔和侧光，自然表情，浅景深背景，真实皮肤质感，专业杂志风格",
+    label: "人物侧脸海报",
+    tag: "IP 视觉",
+    prompt: "核心结构：人物侧脸外轮廓 + 内部世界观填充，适合文学/IP/人物传记海报。\n风格方向：电影海报 + 东方现实主义，强调光影、空间纵深和宿命感。\n质感控制：侧逆光、体积光、轻雾、胶片颗粒，让画面更像正式视觉物料。\n可复用点：把主题换成任意小说、历史人物、城市故事或品牌叙事，都能做系列封面。",
+  },
+  {
+    label: "历史学家玩具",
+    tag: "3D 手办",
+    prompt: "2×2 网格布局，每格展示一个基于“历史学家”职业的可爱玩具人物立牌。输入为一个著名历史学家，分析其典型特征并转化为 Q 版或 chibi 风格：大头小身、夸张表情和代表性服饰或道具（如书卷、古地图、羽毛笔）。整体为 3D 扭蛋场景风格，塑料质感的小公仔站在透明底座上，画面为分层拆解的 split-view，展示人物、底座和扭蛋背景机台，柔和打光，高细节，卡通但带一点收藏手办质感。",
+  },
+  {
+    label: "文本封面主视觉",
+    tag: "社媒封面",
+    prompt: "核心任务：把一句话或大段文本转成“封面主视觉”，适合小红书、X、公众号、Telegram 封面。\n设计思路：苹果设计师思维 + 海报大师思维 + 高桥流，强调大字、留白、冲击力和信息压缩。\n关键能力：让模型“智能梳理文本”，避免把长文逐字堆到图里。\n可复用点：适合金句、信息差、课程标题、文章封面、播客标题、社群公告。",
+  },
+  {
+    label: "社交媒体成瘾",
+    tag: "社论漫画",
+    prompt: "为「社交媒体上瘾」这个主题创作一幅正方形、单格的社论漫画。先推理出最有力、最讽刺的视觉隐喻（例如赌场、仓鼠轮、正在下沉的船、飙车赛道等），再据此构图。画面应一眼就能看出是在批判社交媒体成瘾：人物被界面和通知牵制，氛围略带黑色幽默，细节简洁但寓意清晰，适合社论版头图使用。",
+  },
+];
+
+const ANALYSIS_STEPS = [
+  "正在理解画面主体",
+  "正在检查生图兼容性",
+  "正在预判失败风险",
+  "正在推荐比例与参数",
+  "正在增强风格表达",
+];
+
+const STYLE_ENHANCEMENT_PRESETS: StyleEnhancement[] = [
+  {
+    name: "电影感",
+    description: "更强的镜头、光影和空间纵深",
+    promptFragment: "电影级构图，柔和侧逆光，体积光，浅景深，细腻胶片颗粒，画面具有空间纵深和叙事感。",
+  },
+  {
+    name: "商业摄影",
+    description: "适合产品、人像与高质感展示",
+    promptFragment: "高质感商业摄影棚风格，干净背景，精准布光，真实材质，高细节，主体边缘清晰。",
+  },
+  {
+    name: "社媒封面",
+    description: "更适合小红书、公众号和信息流",
+    promptFragment: "社交媒体封面主视觉，强标题感构图，留白明确，高对比，信息层级清晰，移动端可读性强。",
+  },
+  {
+    name: "极简信息图",
+    description: "适合结构解释、知识卡片与图解",
+    promptFragment: "极简信息图风格，白底黑字，少量辅助线条，模块化排版，层级分明，可读性强。",
+  },
+  {
+    name: "东方水墨",
+    description: "更适合国风、禅意和概念插画",
+    promptFragment: "东方水墨画风格，宣纸纹理，留白构图，墨色层次丰富，克制的红色印章点缀，禅意氛围。",
+  },
+  {
+    name: "3D 手办",
+    description: "适合玩具、公仔、IP 角色",
+    promptFragment: "3D 收藏手办质感，Q 版比例，塑料材质，透明底座，柔和棚拍打光，高细节，干净背景。",
   },
 ];
 
@@ -1026,50 +1133,6 @@ async function createZipBlob(files: Array<{ name: string; blob: Blob; date?: num
   return new Blob([...fileParts, ...centralParts, endHeader.buffer], { type: "application/zip" });
 }
 
-function useDragScroll<T extends HTMLElement>() {
-  const ref = useRef<T | null>(null);
-  const drag = useRef({
-    active: false,
-    startX: 0,
-    scrollLeft: 0,
-  });
-
-  const onPointerDown = (event: ReactPointerEvent<T>) => {
-    const target = event.target as HTMLElement;
-    if (target.closest("button, a, input, textarea, select, summary")) return;
-    drag.current = {
-      active: true,
-      startX: event.clientX,
-      scrollLeft: event.currentTarget.scrollLeft,
-    };
-    event.currentTarget.dataset.dragging = "true";
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
-  const stop = (event: ReactPointerEvent<T>) => {
-    drag.current.active = false;
-    delete event.currentTarget.dataset.dragging;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  };
-
-  const onPointerMove = (event: ReactPointerEvent<T>) => {
-    if (!drag.current.active) return;
-    const delta = event.clientX - drag.current.startX;
-    event.currentTarget.scrollLeft = drag.current.scrollLeft - delta;
-  };
-
-  return {
-    ref,
-    onPointerDown,
-    onPointerMove,
-    onPointerUp: stop,
-    onPointerCancel: stop,
-    onPointerLeave: stop,
-  };
-}
-
 function serializeError(detail: ErrorDetail) {
   try {
     return JSON.stringify(detail, null, 2);
@@ -1172,6 +1235,298 @@ function preferModel(models: string[], current: string) {
   );
 }
 
+function normalizedModelId(model: string) {
+  return model.replace(/^models\//, "").trim().toLowerCase();
+}
+
+function isAnalysisModel(model: string) {
+  const normalized = normalizedModelId(model);
+  return normalized.includes("gpt") && !normalized.includes("image");
+}
+
+function analysisModelPriority(model: string) {
+  const normalized = normalizedModelId(model);
+  if (normalized === "gpt-5.4") return 0;
+  if (normalized.includes("gpt-5.4")) return 1;
+  if (normalized === "gpt-5.5") return 2;
+  if (normalized.includes("gpt-5.5")) return 3;
+  if (normalized === "gpt-5.2") return 4;
+  if (normalized.includes("gpt-5.2")) return 5;
+  if (normalized.includes("gpt-5")) return 6;
+  if (normalized.includes("gpt-4.1")) return 7;
+  if (normalized.includes("gpt-4")) return 8;
+  return 20;
+}
+
+function filterAnalysisModels(models: string[]) {
+  return [...new Set(models)]
+    .filter(isAnalysisModel)
+    .sort((a, b) => {
+      const priority = analysisModelPriority(a) - analysisModelPriority(b);
+      return priority || a.localeCompare(b);
+    });
+}
+
+function preferAnalysisModel(models: string[], current: string) {
+  if (current && models.includes(current)) return current;
+  return models[0] || "";
+}
+
+function analysisModeLabel(mode: AnalysisMode) {
+  if (mode === "optimize") return "提示词优化";
+  if (mode === "params") return "参数推荐";
+  if (mode === "risk") return "失败预判";
+  if (mode === "style") return "风格增强";
+  return "发送前检查";
+}
+
+function riskScore(level: RiskLevel) {
+  if (level === "high") return 3;
+  if (level === "medium") return 2;
+  return 1;
+}
+
+function getOverallRiskLevel(risks: PromptRisk[]): RiskLevel {
+  if (risks.some((risk) => risk.level === "high")) return "high";
+  if (risks.some((risk) => risk.level === "medium")) return "medium";
+  return "low";
+}
+
+function recommendAspectRatioForPrompt(promptText: string, currentAspectRatio: string) {
+  const text = promptText.toLowerCase();
+  if (/头像|avatar|portrait|肖像|近景人像|商品主图/.test(text)) return "1:1";
+  if (/小红书|封面|海报|竖版|手机|story|reels|tiktok|shorts/.test(text)) return "3:4";
+  if (/壁纸|短视频|9:16|竖屏|全身/.test(text)) return "9:16";
+  if (/banner|横幅|头图|网页|视频封面|宽屏|youtube|16:9/.test(text)) return "16:9";
+  if (/建筑|蓝图|住宅|室内|空间|剖面/.test(text)) return "4:3";
+  if (/信息图|知识卡片|公众号|长图|排版/.test(text)) return "4:5";
+  return currentAspectRatio;
+}
+
+function pickStyleEnhancements(promptText: string, mode: AnalysisMode) {
+  const text = promptText.toLowerCase();
+  const matched = STYLE_ENHANCEMENT_PRESETS.filter((preset) => {
+    if (/电影|海报|故事|场景|氛围/.test(text) && preset.name === "电影感") return true;
+    if (/商品|产品|人像|写真|摄影|头像/.test(text) && preset.name === "商业摄影") return true;
+    if (/小红书|封面|公众号|社媒|标题/.test(text) && preset.name === "社媒封面") return true;
+    if (/信息图|结构|图解|文字|知识/.test(text) && preset.name === "极简信息图") return true;
+    if (/水墨|国风|东方|禅|龙/.test(text) && preset.name === "东方水墨") return true;
+    if (/手办|玩具|公仔|chibi|q版|3d/.test(text) && preset.name === "3D 手办") return true;
+    return false;
+  });
+  const base = matched.length > 0 ? matched : STYLE_ENHANCEMENT_PRESETS.slice(0, mode === "style" ? 4 : 2);
+  return base.slice(0, 4);
+}
+
+function createOptimizedPrompt(promptText: string, mode: AnalysisMode) {
+  const trimmed = promptText.trim();
+  if (!trimmed) return "";
+  const styleFragments = pickStyleEnhancements(trimmed, mode).slice(0, mode === "style" ? 2 : 1).map((item) => item.promptFragment);
+  const structure = [
+    trimmed,
+    "主体清晰，构图干净，画面重点明确。",
+    "补充镜头语言、光影方向、材质细节、背景层次和最终用途。",
+    ...styleFragments,
+  ];
+  return [...new Set(structure)].join("\n");
+}
+
+function buildLocalPromptAnalysis({
+  promptText,
+  params,
+  protocol,
+  selectedModel,
+  referenceImages,
+  usableReferenceImages,
+  mode,
+}: {
+  promptText: string;
+  params: ImageParams;
+  protocol: ImageProtocol;
+  selectedModel: string;
+  referenceImages: UploadedReference[];
+  usableReferenceImages: UploadedReference[];
+  mode: AnalysisMode;
+}): PromptAnalysisResult {
+  const trimmed = promptText.trim();
+  const risks: PromptRisk[] = [];
+  const definition = getProtocolDefinition(protocol);
+
+  if (trimmed.length < 10) {
+    risks.push({
+      level: "medium",
+      title: "提示词偏短",
+      description: "主体、场景、光影和用途不够明确，结果随机性会更高。",
+      fix: "补充主体、环境、风格、镜头和用途。",
+    });
+  }
+  if (trimmed.length > 2800) {
+    risks.push({
+      level: "medium",
+      title: "提示词过长",
+      description: "过长的提示词容易稀释重点，也可能触发接口长度限制。",
+      fix: "压缩为主体、风格、构图、约束四段。",
+    });
+  }
+  if (/100%|完全一致|一模一样|高度一致|same face|identical/i.test(trimmed) && usableReferenceImages.length === 0) {
+    risks.push({
+      level: "high",
+      title: "缺少参考图",
+      description: "提示词要求高度一致，但当前没有可用参考图，生成结果很难稳定符合。",
+      fix: "上传清晰参考图，或降低“一致性”要求。",
+    });
+  }
+  if (/文字|标题|排版|字体|logo|标语|slogan|海报/i.test(trimmed)) {
+    risks.push({
+      level: "low",
+      title: "文字渲染存在不确定性",
+      description: "图片模型对精准文字仍可能出错，建议减少文字数量并强调可读性。",
+      fix: "把文字控制在 1-2 个短句，后期可用设计工具补字。",
+    });
+  }
+  if (referenceImages.some((image) => image.status === "error")) {
+    risks.push({
+      level: "high",
+      title: "参考图不可用",
+      description: "存在格式、尺寸或读取失败的参考图，发送时会被过滤。",
+      fix: "移除失败参考图，重新上传 PNG、JPEG 或 WebP。",
+    });
+  }
+  if (referenceImages.some((image) => image.status === "warning")) {
+    risks.push({
+      level: "medium",
+      title: "参考图尺寸较大",
+      description: "大图可能增加请求体积和等待时间。",
+      fix: "优先压缩到 4096px 以下再上传。",
+    });
+  }
+  if (referenceImages.length > 0 && !definition.supportsReferenceImages) {
+    risks.push({
+      level: "medium",
+      title: "当前协议不发送参考图",
+      description: `${definition.shortLabel} 暂不支持参考图，本次生成会按纯文本执行。`,
+      fix: "切换到兼容协议或 Gemini Native。",
+    });
+  }
+  if (!isAspectRatioSupported(protocol, params.aspectRatio)) {
+    risks.push({
+      level: "high",
+      title: "宽高比不兼容",
+      description: "当前协议不支持所选宽高比，请换成协议支持的比例。",
+      fix: "应用系统推荐比例。",
+    });
+  }
+  if (params.batchCount > 8 && params.concurrency > 3) {
+    risks.push({
+      level: "low",
+      title: "批量并发较高",
+      description: "大批量高并发可能遇到限流，排队等待时间也会更长。",
+      fix: "建议并发保持 2-3。",
+    });
+  }
+
+  const suggestedAspectRatio = recommendAspectRatioForPrompt(trimmed, params.aspectRatio);
+  const suggestedParams: SuggestedParams = {
+    aspectRatio: isAspectRatioSupported(protocol, suggestedAspectRatio) ? suggestedAspectRatio : getSupportedAspectRatios(protocol)[0] || "1:1",
+    size: resolveSize(isAspectRatioSupported(protocol, suggestedAspectRatio) ? suggestedAspectRatio : getSupportedAspectRatios(protocol)[0] || "1:1"),
+    count: /海报|封面|logo|文字|信息图/.test(trimmed) ? 2 : Math.min(Math.max(params.batchCount, 2), 4),
+    quality: selectedModel ? params.quality : "auto",
+    styleStrength: mode === "style" ? "high" : "medium",
+    referenceWeight: usableReferenceImages.length > 0 ? "medium" : "low",
+  };
+  const riskLevel = getOverallRiskLevel(risks);
+  const score = clampNumber(94 - risks.reduce((sum, risk) => sum + riskScore(risk.level) * 10, 0), 35, 98);
+  const styleEnhancements = pickStyleEnhancements(trimmed, mode);
+  return {
+    safe: riskLevel !== "high",
+    score,
+    riskLevel,
+    summary: riskLevel === "low"
+      ? "提示词可以直接生成，建议可作为增强参考。"
+      : riskLevel === "medium"
+        ? "可以生成，但有几处会影响稳定性和效果。"
+        : "存在较高失败或偏离风险，建议先修复再生成。",
+    optimizedPrompt: createOptimizedPrompt(trimmed, mode),
+    suggestedNegativePrompt: params.negativePrompt || "低清晰度，畸形结构，错误文字，重复肢体，低质量，过度锐化",
+    suggestedParams,
+    risks,
+    styleEnhancements,
+    source: "local",
+  };
+}
+
+function safeRiskLevel(value: unknown): RiskLevel {
+  return value === "high" || value === "medium" || value === "low" ? value : "low";
+}
+
+function normalizePromptRisk(value: unknown): PromptRisk | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" ? record.title : "";
+  const description = typeof record.description === "string" ? record.description : "";
+  if (!title && !description) return null;
+  return {
+    level: safeRiskLevel(record.level),
+    title: title || "生成风险",
+    description: description || "需要进一步检查。",
+    fix: typeof record.fix === "string" ? record.fix : undefined,
+  };
+}
+
+function normalizeStyleEnhancement(value: unknown): StyleEnhancement | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const name = typeof record.name === "string" ? record.name : "";
+  const description = typeof record.description === "string" ? record.description : "";
+  const promptFragment = typeof record.promptFragment === "string" ? record.promptFragment : "";
+  if (!name || !promptFragment) return null;
+  return { name, description, promptFragment };
+}
+
+function normalizeSuggestedParams(value: unknown, fallback: SuggestedParams): SuggestedParams {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  return {
+    aspectRatio: typeof record.aspectRatio === "string" ? record.aspectRatio : fallback.aspectRatio,
+    size: typeof record.size === "string" ? record.size : fallback.size,
+    count: typeof record.count === "number" ? record.count : fallback.count,
+    quality: typeof record.quality === "string" ? record.quality : fallback.quality,
+    styleStrength: record.styleStrength === "low" || record.styleStrength === "medium" || record.styleStrength === "high"
+      ? record.styleStrength
+      : fallback.styleStrength,
+    referenceWeight: record.referenceWeight === "low" || record.referenceWeight === "medium" || record.referenceWeight === "high"
+      ? record.referenceWeight
+      : fallback.referenceWeight,
+  };
+}
+
+function normalizePromptAnalysisResult(value: unknown, fallback: PromptAnalysisResult): PromptAnalysisResult {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const risks = Array.isArray(record.risks)
+    ? record.risks.map(normalizePromptRisk).filter((item): item is PromptRisk => Boolean(item))
+    : fallback.risks;
+  const styleEnhancements = Array.isArray(record.styleEnhancements)
+    ? record.styleEnhancements.map(normalizeStyleEnhancement).filter((item): item is StyleEnhancement => Boolean(item))
+    : fallback.styleEnhancements;
+  const riskLevel = safeRiskLevel(record.riskLevel || getOverallRiskLevel(risks));
+  return {
+    safe: typeof record.safe === "boolean" ? record.safe : riskLevel !== "high",
+    score: typeof record.score === "number" ? clampNumber(record.score, 0, 100) : fallback.score,
+    riskLevel,
+    summary: typeof record.summary === "string" && record.summary.trim() ? record.summary : fallback.summary,
+    optimizedPrompt: typeof record.optimizedPrompt === "string" && record.optimizedPrompt.trim()
+      ? record.optimizedPrompt
+      : fallback.optimizedPrompt,
+    suggestedNegativePrompt: typeof record.suggestedNegativePrompt === "string"
+      ? record.suggestedNegativePrompt
+      : fallback.suggestedNegativePrompt,
+    suggestedParams: normalizeSuggestedParams(record.suggestedParams, fallback.suggestedParams),
+    risks,
+    styleEnhancements: styleEnhancements.length > 0 ? styleEnhancements : fallback.styleEnhancements,
+    analysisModel: typeof record.analysisModel === "string" ? record.analysisModel : fallback.analysisModel,
+    source: record.source === "ai" || record.source === "local" ? record.source : fallback.source,
+  };
+}
+
 function createJob(
   index: number,
   total: number,
@@ -1205,10 +1560,14 @@ export default function App() {
   const [activePage, setActivePage] = useState<AppPage>(pageFromHash);
   const [referenceImages, setReferenceImages] = useState<UploadedReference[]>([]);
   const [models, setModels] = useState<string[]>([]);
+  const [analysisModels, setAnalysisModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState(() => {
     const storedModel = localStorage.getItem("imageStudioSelectedModel") || "";
     return isAllowedImageModel(storedModel) ? storedModel : "";
   });
+  const [selectedAnalysisModel, setSelectedAnalysisModel] = useState(() =>
+    localStorage.getItem("imageStudioSelectedAnalysisModel") || "",
+  );
   const [modelFilter, setModelFilter] = useState("");
   const [modelState, setModelState] = useState<ModelLoadState>({
     status: "idle",
@@ -1237,8 +1596,16 @@ export default function App() {
   );
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [isAutoLoadingModels, setIsAutoLoadingModels] = useState(false);
+  const [showPromptPresets, setShowPromptPresets] = useState(false);
+  const [isPromptFocused, setIsPromptFocused] = useState(false);
   const [isBulkDownloading, setIsBulkDownloading] = useState(false);
   const [isSendLaunching, setIsSendLaunching] = useState(false);
+  const [analysisState, setAnalysisState] = useState<PromptAnalysisState>({
+    status: "idle",
+    mode: "send",
+    message: "",
+  });
+  const [analysisStepIndex, setAnalysisStepIndex] = useState(0);
   const [now, setNow] = useState(Date.now());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const promptTextareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -1261,7 +1628,6 @@ export default function App() {
   const sendLaunchTimerRef = useRef<number | undefined>(undefined);
   const modelLoadRequestRef = useRef(0);
   const lastAutoModelLoadKeyRef = useRef("");
-  const starterDrag = useDragScroll<HTMLDivElement>();
   const protocolDefinition = getProtocolDefinition(apiConfig.protocol);
   const selectedAspectRatio = getAspectDefinition(params.aspectRatio);
   const resolvedRequestSize = resolveSize(params.aspectRatio);
@@ -1274,6 +1640,10 @@ export default function App() {
       .filter((model) => model.toLowerCase().includes(query))
       .slice(0, 80);
   }, [modelFilter, models]);
+  const preferredAnalysisModel = useMemo(
+    () => preferAnalysisModel(analysisModels, selectedAnalysisModel),
+    [analysisModels, selectedAnalysisModel],
+  );
 
   const visibleStats = useMemo(() => {
     return visibleRecords.reduce(
@@ -1301,6 +1671,9 @@ export default function App() {
   );
   const referenceIssueCount = referenceImages.filter((image) => image.status === "error").length;
   const referenceWarningCount = referenceImages.filter((image) => image.status === "warning").length;
+  const showPromptGroupHint = isPromptFocused || prompt.trim().length > 0;
+  const isPromptAnalyzing = analysisState.status === "analyzing";
+  const currentAnalysisMessage = ANALYSIS_STEPS[analysisStepIndex % ANALYSIS_STEPS.length];
   const canGenerate =
     prompt.trim().length > 0 &&
     selectedModel.length > 0 &&
@@ -1308,6 +1681,7 @@ export default function App() {
     models.includes(selectedModel) &&
     modelState.status === "ready" &&
     aspectRatioSupported;
+  const canRequestGenerate = canGenerate && !isPromptAnalyzing;
 
   useEffect(() => {
     void loadMainRecordsPage();
@@ -1355,6 +1729,10 @@ export default function App() {
     localStorage.setItem("imageStudioSelectedModel", selectedModel);
   }, [selectedModel]);
 
+  useEffect(() => {
+    localStorage.setItem("imageStudioSelectedAnalysisModel", selectedAnalysisModel);
+  }, [selectedAnalysisModel]);
+
   useLayoutEffect(() => {
     resizePromptTextarea();
   }, [prompt]);
@@ -1378,6 +1756,17 @@ export default function App() {
     const timer = window.setInterval(() => setNow(Date.now()), 500);
     return () => window.clearInterval(timer);
   }, [visibleRecords]);
+
+  useEffect(() => {
+    if (!isPromptAnalyzing) {
+      setAnalysisStepIndex(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setAnalysisStepIndex((current) => current + 1);
+    }, 860);
+    return () => window.clearInterval(timer);
+  }, [isPromptAnalyzing]);
 
   useEffect(() => {
     return () => {
@@ -1735,13 +2124,17 @@ export default function App() {
         throw new Error("接口返回了空模型列表");
       }
       const nextModels = filterAllowedImageModels(upstreamModels);
+      const nextAnalysisModels = filterAnalysisModels(upstreamModels);
       if (nextModels.length === 0) {
         throw new Error("未找到可用的 image-2 模型");
       }
       const nextSelectedModel = preferModel(nextModels, selectedModel);
+      const nextSelectedAnalysisModel = preferAnalysisModel(nextAnalysisModels, selectedAnalysisModel);
       lastAutoModelLoadKeyRef.current = modelLoadKey;
       setModels(nextModels);
       setSelectedModel(nextSelectedModel);
+      setAnalysisModels(nextAnalysisModels);
+      setSelectedAnalysisModel(nextSelectedAnalysisModel);
       setModelFilter("");
       setModelState({ status: "ready", message: `${nextModels.length} 个 image-2 模型` });
       if (silent && showOnboarding && onboardingStep < 2) {
@@ -1751,6 +2144,8 @@ export default function App() {
       if (requestId !== modelLoadRequestRef.current || silent) return;
       setModels([]);
       setSelectedModel("");
+      setAnalysisModels([]);
+      setSelectedAnalysisModel("");
       setModelState({ status: "error", message: formatError(error) });
     } finally {
       if (silent) {
@@ -1870,20 +2265,219 @@ export default function App() {
     }
   }
 
-  async function startBatch(event?: FormEvent) {
+  function analysisFallback(mode: AnalysisMode, promptText = prompt.trim()) {
+    return buildLocalPromptAnalysis({
+      promptText,
+      params,
+      protocol: apiConfig.protocol,
+      selectedModel,
+      referenceImages,
+      usableReferenceImages,
+      mode,
+    });
+  }
+
+  async function runPromptAnalysis(mode: AnalysisMode, promptText = prompt.trim()) {
+    const fallback = analysisFallback(mode, promptText);
+    const analysisModel = preferAnalysisModel(analysisModels, selectedAnalysisModel);
+    if (!analysisModel || !apiConfig.apiKey.trim()) {
+      return {
+        ...fallback,
+        analysisModel: analysisModel || "本地预检",
+        source: "local" as const,
+        summary: analysisModel
+          ? "未配置 API Key，已先用本地规则完成预检。"
+          : "未检测到 GPT 分析模型，已先用本地规则完成预检。",
+      };
+    }
+
+    const response = await fetch("/api/prompt/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+        apiKey: apiConfig.apiKey,
+        analysisModel,
+        prompt: promptText,
+        negativePrompt: params.negativePrompt,
+        aspectRatio: params.aspectRatio,
+        size: resolvedRequestSize,
+        quality: params.quality,
+        outputFormat: params.outputFormat,
+        count: params.batchCount,
+        concurrency: params.concurrency,
+        referenceCount: usableReferenceImages.length,
+        referenceIssues: referenceImages
+          .filter((image) => image.status && image.status !== "ready")
+          .map((image) => ({ name: image.name, status: image.status, message: image.message })),
+        protocol: apiConfig.protocol,
+        imageModel: selectedModel,
+        mode,
+      }),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw payload.detail || payload;
+    }
+    return normalizePromptAnalysisResult(payload.analysis, {
+      ...fallback,
+      analysisModel,
+      source: "ai",
+    });
+  }
+
+  function triggerSendLaunchAnimation() {
+    if (sendLaunchFrameRef.current) {
+      window.cancelAnimationFrame(sendLaunchFrameRef.current);
+    }
+    if (sendLaunchTimerRef.current) {
+      window.clearTimeout(sendLaunchTimerRef.current);
+    }
+    setIsSendLaunching(false);
+    sendLaunchFrameRef.current = window.requestAnimationFrame(() => {
+      setIsSendLaunching(true);
+      sendLaunchTimerRef.current = window.setTimeout(() => setIsSendLaunching(false), 760);
+    });
+  }
+
+  function buildParamsFromAnalysis(result: PromptAnalysisResult, applyRecommendedParams = true) {
+    const suggestedRatio = result.suggestedParams.aspectRatio || params.aspectRatio;
+    const nextRatio = applyRecommendedParams && isAspectRatioSupported(apiConfig.protocol, suggestedRatio)
+      ? suggestedRatio
+      : params.aspectRatio;
+    return {
+      ...params,
+      aspectRatio: nextRatio,
+      size: resolveSize(nextRatio),
+      quality: applyRecommendedParams && protocolDefinition.supportsQuality && result.suggestedParams.quality
+        ? result.suggestedParams.quality
+        : params.quality,
+      batchCount: applyRecommendedParams && result.suggestedParams.count
+        ? clampNumber(Number(result.suggestedParams.count), 1, 20)
+        : params.batchCount,
+      negativePrompt: applyRecommendedParams && result.suggestedNegativePrompt && !params.negativePrompt.trim()
+        ? result.suggestedNegativePrompt
+        : params.negativePrompt,
+    };
+  }
+
+  function applySuggestedParams(result: PromptAnalysisResult) {
+    updateParams(buildParamsFromAnalysis(result, true));
+  }
+
+  function applyOptimizedPrompt(result: PromptAnalysisResult) {
+    setPrompt(result.optimizedPrompt);
+    window.requestAnimationFrame(resizePromptTextarea);
+  }
+
+  function appendStyleEnhancement(enhancement: StyleEnhancement) {
+    setPrompt((current) => `${current.trim()}\n${enhancement.promptFragment}`.trim());
+    window.requestAnimationFrame(resizePromptTextarea);
+  }
+
+  async function requestPromptAssist(mode: AnalysisMode) {
+    const submittedPrompt = prompt.trim();
+    if (!submittedPrompt || isPromptAnalyzing) return;
+    setShowPromptPresets(false);
+    setAnalysisState({
+      status: "analyzing",
+      mode,
+      message: analysisModeLabel(mode),
+    });
+    try {
+      const result = await runPromptAnalysis(mode, submittedPrompt);
+      setAnalysisState({
+        status: "ready",
+        mode,
+        message: `${analysisModeLabel(mode)}完成`,
+        result,
+      });
+    } catch (error) {
+      setAnalysisState({
+        status: "error",
+        mode,
+        message: `${analysisModeLabel(mode)}失败`,
+        error: formatError(error),
+      });
+    }
+  }
+
+  async function analyzeBeforeGenerate(submittedPrompt: string) {
+    setShowPromptPresets(false);
+    setAnalysisState({
+      status: "analyzing",
+      mode: "send",
+      message: "发送前智能检查",
+    });
+    try {
+      const result = await runPromptAnalysis("send", submittedPrompt);
+      if (result.safe && result.riskLevel === "low") {
+        setAnalysisState({
+          status: "ready",
+          mode: "send",
+          message: "检查通过，已进入生成队列",
+          result,
+        });
+        await startBatch(undefined, { promptOverride: submittedPrompt });
+        window.setTimeout(() => {
+          setAnalysisState((current) => current.result === result ? { status: "idle", mode: "send", message: "" } : current);
+        }, 1400);
+        return;
+      }
+      setAnalysisState({
+        status: "ready",
+        mode: "send",
+        message: result.riskLevel === "high" ? "建议先修复后生成" : "发现可优化项",
+        result,
+      });
+    } catch (error) {
+      setAnalysisState({
+        status: "error",
+        mode: "send",
+        message: "智能分析失败",
+        error: formatError(error),
+      });
+    }
+  }
+
+  function continueFromAnalysis({
+    useOptimizedPrompt = false,
+    applyRecommendedParams = false,
+  }: {
+    useOptimizedPrompt?: boolean;
+    applyRecommendedParams?: boolean;
+  } = {}) {
+    const result = analysisState.result;
+    const submittedPrompt = useOptimizedPrompt && result?.optimizedPrompt ? result.optimizedPrompt : prompt.trim();
+    if (!submittedPrompt || !canGenerate) return;
+    const nextParams = result ? buildParamsFromAnalysis(result, applyRecommendedParams) : params;
+    if (result && applyRecommendedParams) {
+      setParams(nextParams);
+    }
+    triggerSendLaunchAnimation();
+    setAnalysisState({ status: "idle", mode: "send", message: "" });
+    void startBatch(undefined, { promptOverride: submittedPrompt, paramsOverride: nextParams });
+  }
+
+  async function startBatch(
+    event?: FormEvent,
+    options: { promptOverride?: string; paramsOverride?: ImageParams } = {},
+  ) {
     event?.preventDefault();
     if (!canGenerate) return;
-    const total = clampNumber(Number(params.batchCount), 1, 20);
-    const concurrency = clampNumber(Number(params.concurrency), 1, 6);
+    const batchParams = options.paramsOverride || params;
+    const total = clampNumber(Number(batchParams.batchCount), 1, 20);
+    const concurrency = clampNumber(Number(batchParams.concurrency), 1, 6);
     const batchId = uid();
     const batchCreatedAt = Date.now();
-    const submittedPrompt = prompt.trim();
+    const submittedPrompt = (options.promptOverride || prompt).trim();
+    if (!submittedPrompt) return;
     const snapshotConfig = { ...apiConfig };
     const snapshotParams = {
-      ...params,
+      ...batchParams,
       batchCount: total,
       concurrency,
-      size: resolvedRequestSize,
+      size: batchParams.size || resolveSize(batchParams.aspectRatio),
     };
     const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
       ? usableReferenceImages
@@ -1910,22 +2504,13 @@ export default function App() {
   }
 
   function requestStartBatch() {
-    if (!canGenerate) return;
+    if (!canRequestGenerate) return;
     const nextStart = performance.now();
     if (nextStart - startIntentRef.current < 400) return;
     startIntentRef.current = nextStart;
-    if (sendLaunchFrameRef.current) {
-      window.cancelAnimationFrame(sendLaunchFrameRef.current);
-    }
-    if (sendLaunchTimerRef.current) {
-      window.clearTimeout(sendLaunchTimerRef.current);
-    }
-    setIsSendLaunching(false);
-    sendLaunchFrameRef.current = window.requestAnimationFrame(() => {
-      setIsSendLaunching(true);
-      sendLaunchTimerRef.current = window.setTimeout(() => setIsSendLaunching(false), 760);
-    });
-    void startBatch();
+    const submittedPrompt = prompt.trim();
+    triggerSendLaunchAnimation();
+    void analyzeBeforeGenerate(submittedPrompt);
   }
 
   async function retryJob(job: Job) {
@@ -2009,6 +2594,7 @@ export default function App() {
   function changeProtocol(protocol: ImageProtocol) {
     const nextDefinition = getProtocolDefinition(protocol);
     const nextModels = filterAllowedImageModels(nextDefinition.defaultModels);
+    const nextAnalysisModels = filterAnalysisModels(nextDefinition.defaultModels);
     setApiConfig((current) => {
       return {
         ...current,
@@ -2018,6 +2604,8 @@ export default function App() {
     });
     setModels(nextModels);
     setSelectedModel((current) => preferModel(nextModels, current));
+    setAnalysisModels(nextAnalysisModels);
+    setSelectedAnalysisModel((current) => preferAnalysisModel(nextAnalysisModels, current));
     setModelFilter("");
     setModelState(
       nextModels.length > 0
@@ -2048,6 +2636,8 @@ export default function App() {
 
   function applyPromptStarter(nextPrompt: string) {
     setPrompt((current) => (current.trim() ? `${current.trim()}\n${nextPrompt}` : nextPrompt));
+    setShowPromptPresets(false);
+    window.requestAnimationFrame(resizePromptTextarea);
   }
 
   function previewCurrent(item: Job | HistoryRecord) {
@@ -2101,6 +2691,14 @@ export default function App() {
     setShowOnboarding(false);
     setOnboardingStep(0);
   }
+
+  const analysisResult = analysisState.result;
+  const suggestedRatio = analysisResult?.suggestedParams.aspectRatio;
+  const suggestedSize = analysisResult?.suggestedParams.size || (suggestedRatio ? resolveSize(suggestedRatio) : "");
+  const suggestedCount = analysisResult?.suggestedParams.count;
+  const analysisSourceLabel = analysisResult?.source === "ai"
+    ? `AI · ${analysisResult.analysisModel || preferredAnalysisModel}`
+    : analysisResult?.analysisModel || "本地预检";
 
   if (activePage === "home") {
     return <HomePage onEnter={enterStudio} onAdmin={enterAdmin} />;
@@ -2302,7 +2900,7 @@ export default function App() {
         </section>
 
         <form
-          className="composer"
+          className={`composer ${isPromptAnalyzing ? "is-analyzing" : ""}`}
           data-onboarding-target="composer"
           onSubmit={(event) => {
             event.preventDefault();
@@ -2311,14 +2909,38 @@ export default function App() {
           onDragOver={(event) => event.preventDefault()}
           onDrop={onComposerDrop}
         >
-          <div className="starter-rail" {...starterDrag}>
-            {PROMPT_STARTERS.map((starter) => (
-              <button type="button" key={starter.label} onClick={() => applyPromptStarter(starter.prompt)}>
-                <strong>{starter.label}</strong>
-                <span>{starter.prompt}</span>
-              </button>
-            ))}
-          </div>
+          {showPromptPresets && (
+            <div className="prompt-presets-panel">
+              <div className="prompt-presets-head">
+                <div>
+                  <strong>预设提示词</strong>
+                  <span>点击模板填入输入框，填入后仍可继续编辑。</span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="收起预设提示词"
+                  onClick={() => setShowPromptPresets(false)}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="prompt-presets-grid">
+                {PROMPT_STARTERS.map((starter) => (
+                  <button
+                    type="button"
+                    className="prompt-preset-card"
+                    key={starter.label}
+                    onClick={() => applyPromptStarter(starter.prompt)}
+                  >
+                    <span>{starter.tag}</span>
+                    <strong>{starter.label}</strong>
+                    <small>{starter.prompt}</small>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           {referenceImages.length > 0 && (
             <div className="reference-strip">
               {!protocolDefinition.supportsReferenceImages && (
@@ -2349,6 +2971,144 @@ export default function App() {
               ))}
             </div>
           )}
+          {analysisState.status !== "idle" && (
+            <div className={`prompt-analysis-panel ${analysisState.status} risk-${analysisResult?.riskLevel || "low"}`}>
+              <div className="analysis-panel-head">
+                <div className="analysis-orb" aria-hidden="true">
+                  {analysisState.status === "analyzing" ? <Loader2 size={16} className="spin" /> : <WandSparkles size={16} />}
+                </div>
+                <div>
+                  <strong>{analysisState.message || analysisModeLabel(analysisState.mode)}</strong>
+                  <span>
+                    {analysisState.status === "analyzing"
+                      ? currentAnalysisMessage
+                      : analysisResult
+                        ? `${analysisSourceLabel} · 评分 ${analysisResult.score}`
+                        : analysisState.error || "可以稍后重试"}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="关闭智能建议"
+                  onClick={() => setAnalysisState({ status: "idle", mode: "send", message: "" })}
+                >
+                  <X size={16} />
+                </button>
+              </div>
+
+              {analysisState.status === "analyzing" && (
+                <div className="analysis-scan">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              )}
+
+              {analysisState.status === "error" && (
+                <div className="analysis-error">
+                  <AlertCircle size={16} />
+                  <span>{analysisState.error || "分析接口暂时不可用"}</span>
+                  {analysisState.mode === "send" && (
+                    <button type="button" className="subtle-button" onClick={() => continueFromAnalysis()}>
+                      跳过分析继续生成
+                    </button>
+                  )}
+                </div>
+              )}
+
+              {analysisResult && analysisState.status === "ready" && (
+                <>
+                  <div className="analysis-summary">
+                    <div className={`risk-badge ${analysisResult.riskLevel}`}>
+                      {analysisResult.riskLevel === "high" ? "高风险" : analysisResult.riskLevel === "medium" ? "建议优化" : "可直接生成"}
+                    </div>
+                    <p>{analysisResult.summary}</p>
+                  </div>
+
+                  {analysisResult.risks.length > 0 && (
+                    <div className="analysis-section">
+                      <strong>失败预判</strong>
+                      <div className="analysis-risk-list">
+                        {analysisResult.risks.slice(0, 4).map((risk) => (
+                          <div className={`analysis-risk ${risk.level}`} key={`${risk.title}-${risk.level}`}>
+                            <span>{risk.title}</span>
+                            <small>{risk.description}{risk.fix ? ` · 建议：${risk.fix}` : ""}</small>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="analysis-section">
+                    <strong>参数推荐</strong>
+                    <div className="analysis-param-grid">
+                      <span>比例 <b>{suggestedRatio || params.aspectRatio}</b></span>
+                      <span>尺寸 <b>{suggestedSize || resolvedRequestSize}</b></span>
+                      <span>张数 <b>{suggestedCount || params.batchCount}</b></span>
+                      <span>风格 <b>{analysisResult.suggestedParams.styleStrength || "medium"}</b></span>
+                    </div>
+                  </div>
+
+                  <div className="analysis-section">
+                    <strong>提示词优化</strong>
+                    <div className="optimized-prompt-preview">{analysisResult.optimizedPrompt}</div>
+                  </div>
+
+                  {analysisResult.styleEnhancements.length > 0 && (
+                    <div className="analysis-section">
+                      <strong>风格增强</strong>
+                      <div className="style-enhancement-row">
+                        {analysisResult.styleEnhancements.slice(0, 4).map((enhancement) => (
+                          <button
+                            type="button"
+                            key={enhancement.name}
+                            className="style-enhancement-chip"
+                            title={enhancement.description}
+                            onClick={() => appendStyleEnhancement(enhancement)}
+                          >
+                            {enhancement.name}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="analysis-actions">
+                    {analysisState.mode === "send" ? (
+                      <>
+                        <button
+                          type="button"
+                          className="primary-action compact"
+                          onClick={() => continueFromAnalysis({ useOptimizedPrompt: true, applyRecommendedParams: true })}
+                        >
+                          <WandSparkles size={15} />
+                          使用优化版生成
+                        </button>
+                        <button type="button" className="subtle-button" onClick={() => continueFromAnalysis()}>
+                          原样继续
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <button type="button" className="primary-action compact" onClick={() => applyOptimizedPrompt(analysisResult)}>
+                          <WandSparkles size={15} />
+                          应用优化提示词
+                        </button>
+                        <button type="button" className="subtle-button" onClick={() => applySuggestedParams(analysisResult)}>
+                          应用推荐参数
+                        </button>
+                      </>
+                    )}
+                    <button type="button" className="subtle-button" onClick={() => copyPrompt(analysisResult.optimizedPrompt)}>
+                      <Copy size={15} />
+                      复制优化版
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
           <div className="composer-main">
             <button
               type="button"
@@ -2358,11 +3118,23 @@ export default function App() {
             >
               <UploadCloud size={19} />
             </button>
+            <button
+              type="button"
+              className={`icon-button preset-toggle-button ${!showPromptPresets && !prompt.trim() ? "is-guiding" : ""}`}
+              title={showPromptPresets ? "收起预设提示词" : "查看预设提示词"}
+              aria-expanded={showPromptPresets}
+              onClick={() => setShowPromptPresets((value) => !value)}
+            >
+              <WandSparkles size={18} />
+              <span>预设</span>
+            </button>
             <textarea
               ref={promptTextareaRef}
               value={prompt}
               onChange={(event) => setPrompt(event.target.value)}
               onInput={resizePromptTextarea}
+              onFocus={() => setIsPromptFocused(true)}
+              onBlur={() => setIsPromptFocused(false)}
               onKeyDown={(event) => {
                 if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
                   event.preventDefault();
@@ -2376,9 +3148,9 @@ export default function App() {
             <button
               type="button"
               className={`send-button${isSendLaunching ? " is-launching" : ""}`}
-              title="生成"
+              title={isPromptAnalyzing ? "正在分析提示词" : "生成"}
               aria-label="生成图片"
-              disabled={!canGenerate}
+              disabled={!canRequestGenerate}
               onPointerDown={(event) => {
                 if (event.button !== 0) return;
                 event.preventDefault();
@@ -2397,6 +3169,32 @@ export default function App() {
               </span>
             </button>
           </div>
+          <div className="prompt-assist-bar" aria-label="智能创作工具">
+            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("optimize")}>
+              <WandSparkles size={14} />
+              优化提示词
+            </button>
+            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("params")}>
+              <Settings2 size={14} />
+              参数推荐
+            </button>
+            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("risk")}>
+              <ShieldCheck size={14} />
+              失败预判
+            </button>
+            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("style")}>
+              <WandSparkles size={14} />
+              风格增强
+            </button>
+          </div>
+          {showPromptGroupHint && (
+            <div className="prompt-group-hint" role="note">
+              <WandSparkles size={14} />
+              <span>
+                推荐使用 <strong>banana Pro 官转</strong> 或 <strong>OpenRouter</strong> 分组。
+              </span>
+            </div>
+          )}
           <div className="composer-meta">
             <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
               {referenceImages.length > 0
@@ -2492,6 +3290,32 @@ export default function App() {
               <AlertCircle size={15} />
             )}
             <span>{isAutoLoadingModels ? "正在自动读取 image-2 模型..." : modelState.message}</span>
+          </div>
+          <label>
+            <span>智能分析 AI</span>
+            <select
+              value={preferredAnalysisModel}
+              disabled={analysisModels.length === 0}
+              onChange={(event) => setSelectedAnalysisModel(event.target.value)}
+            >
+              {analysisModels.length === 0 ? (
+                <option value="">未检测到 GPT 分析模型</option>
+              ) : (
+                analysisModels.map((model) => (
+                  <option key={model} value={model}>
+                    {model}
+                  </option>
+                ))
+              )}
+            </select>
+          </label>
+          <div className={`status-line ${analysisModels.length > 0 ? "ready" : "idle"}`}>
+            {analysisModels.length > 0 ? <ShieldCheck size={15} /> : <AlertCircle size={15} />}
+            <span>
+              {analysisModels.length > 0
+                ? `发送前使用 ${preferredAnalysisModel} 做提示词优化、参数推荐和失败预判`
+                : "没有 GPT 文本模型时，会先使用本地规则预检"}
+            </span>
           </div>
           <div className="local-save-note">
             <Database size={15} />
