@@ -2518,6 +2518,8 @@ export default function App() {
   const selectedResolutionDefinition = IMAGE_RESOLUTIONS.find((item) => item.value === selectedResolution) || IMAGE_RESOLUTIONS[0];
   const resolvedRequestSize = resolveSize(params.aspectRatio, selectedResolution);
   const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio);
+  const composerConfigSummary = `${params.batchCount}张 · ${params.aspectRatio} · ${selectedResolution}`;
+  const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
 
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
@@ -5192,6 +5194,18 @@ export default function App() {
             />
             <button
               type="button"
+              className={`composer-config-button ${isSettingsOpen ? "active" : ""}`}
+              title={`打开生成配置：${composerConfigSummary} · ${composerConfigDetail}`}
+              aria-label={`打开生成配置，当前 ${composerConfigSummary}`}
+              onClick={() => setIsSettingsOpen(true)}
+            >
+              <Settings2 size={15} />
+              <span>{params.batchCount}张</span>
+              <span>{params.aspectRatio}</span>
+              <span>{selectedResolution}</span>
+            </button>
+            <button
+              type="button"
               className={`send-button${isSendLaunching ? " is-launching" : ""}`}
               title={isPromptAnalyzing ? "正在分析提示词" : "生成"}
               aria-label="生成图片"
@@ -5235,6 +5249,9 @@ export default function App() {
           <div className="composer-meta">
             <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
               {referenceMetaLabel}
+            </span>
+            <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
+              {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
             </span>
             <label className="composer-auto-toggle" title="发送前自动优化提示词">
               <input
