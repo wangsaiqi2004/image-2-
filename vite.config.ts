@@ -111,6 +111,9 @@ type RequestLog = {
   upstreamReferenceCount?: number;
   upstreamReferenceMode?: string;
   upstreamSize?: string;
+  requestParams?: unknown;
+  upstreamRequest?: unknown;
+  responseBody?: unknown;
   status: RequestLogStatus;
   httpStatus?: number;
   errorMessage?: string;
@@ -361,6 +364,73 @@ function apiKeyLogMeta(apiKey: string) {
   };
 }
 
+function redactImageText(value: string, max = 4000) {
+  return truncateText(value, max)
+    .replace(/data:image\/[a-zA-Z+.-]+;base64,[A-Za-z0-9+/=]+/g, "[image-data-redacted]")
+    .replace(/"b64_json"\s*:\s*"[^"]+"/g, "\"b64_json\":\"[image-data-redacted]\"")
+    .replace(/"dataUrl"\s*:\s*"[^"]+"/g, "\"dataUrl\":\"[image-data-redacted]\"")
+    .replace(/"thumbnailDataUrl"\s*:\s*"[^"]+"/g, "\"thumbnailDataUrl\":\"[image-data-redacted]\"")
+    .replace(/"data"\s*:\s*"[A-Za-z0-9+/=]{180,}"/g, "\"data\":\"[large-data-redacted]\"");
+}
+
+function looksLikeLargeBase64(value: string) {
+  return value.length > 180 && /^[A-Za-z0-9+/=\r\n]+$/.test(value);
+}
+
+function referenceImagesForLog(value: unknown) {
+  if (!Array.isArray(value)) return value;
+  return value.map((item, index) => {
+    const image = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const dataUrl = typeof image.dataUrl === "string" ? image.dataUrl : "";
+    return {
+      index,
+      name: typeof image.name === "string" ? truncateText(image.name, 240) : undefined,
+      type: typeof image.type === "string" ? image.type : undefined,
+      hasImageContent: Boolean(dataUrl),
+      imageContentBytes: dataUrl.length,
+      dataUrl: dataUrl ? "[image-data-redacted]" : undefined,
+    };
+  });
+}
+
+function sanitizeForLog(value: unknown, key = "", depth = 0): unknown {
+  const lowerKey = key.toLowerCase();
+  if (depth > 8) return "[depth-limit]";
+  if (value === null || value === undefined) return value;
+  if (lowerKey === "apikey" || lowerKey === "api_key" || lowerKey === "authorization" || lowerKey === "password" || lowerKey === "token") {
+    return "[redacted]";
+  }
+  if (lowerKey === "referenceimages") {
+    return referenceImagesForLog(value);
+  }
+  if (typeof value === "string") {
+    if (
+      value.startsWith("data:image/")
+      || lowerKey === "dataurl"
+      || lowerKey === "thumbnaildataurl"
+      || lowerKey === "b64_json"
+      || (lowerKey === "data" && looksLikeLargeBase64(value))
+    ) {
+      return `[image-data-redacted:${value.length} chars]`;
+    }
+    return redactImageText(value);
+  }
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 80).map((item) => sanitizeForLog(item, key, depth + 1));
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(record).map(([entryKey, entryValue]) => [
+        entryKey,
+        sanitizeForLog(entryValue, entryKey, depth + 1),
+      ]),
+    );
+  }
+  return String(value);
+}
+
 function normalizeAllowedApiBaseUrl(value: string) {
   const normalized = value.trim().replace(/\/+$/, "");
   const match = ALLOWED_API_BASE_URLS.find((allowed) => allowed.replace(/\/+$/, "") === normalized);
@@ -401,10 +471,7 @@ function safeErrorSummary(detail: unknown) {
     ),
     type: typeof error.type === "string" ? error.type : undefined,
     code: typeof error.code === "string" ? error.code : undefined,
-    raw: truncateText(detail, 2500)
-      .replace(/data:image\/[a-zA-Z+.-]+;base64,[A-Za-z0-9+/=]+/g, "[image-data-redacted]")
-      .replace(/"b64_json"\s*:\s*"[^"]+"/g, "\"b64_json\":\"[image-data-redacted]\"")
-      .replace(/"data"\s*:\s*"[A-Za-z0-9+/=]{180,}"/g, "\"data\":\"[large-data-redacted]\""),
+    raw: redactImageText(typeof detail === "string" ? detail : JSON.stringify(sanitizeForLog(detail)), 2500),
   };
 }
 
@@ -809,7 +876,7 @@ function normalizeAnalysisPayload(value: unknown, analysisModel: string) {
   };
 }
 
-async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: ProxyBody) {
+async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: ProxyBody, requestId?: string) {
   const analysisModel = getString(body, "analysisModel");
   const prompt = getString(body, "prompt");
   if (!analysisModel) throw new Error("分析模型不能为空");
@@ -843,24 +910,40 @@ async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: Proxy
     "优化提示词时要保留用户原意，不要替换主体，不要加入未授权的具体人物身份。",
   ].join("\n");
 
+  const upstreamPayload = {
+    model: analysisModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify(context, null, 2) },
+    ],
+    temperature: 0.2,
+    response_format: { type: "json_object" },
+  };
+  if (requestId) {
+    updateRequestLog(requestId, {
+      upstreamPayloadKeys: Object.keys(upstreamPayload),
+      upstreamRequest: sanitizeForLog(upstreamPayload),
+    });
+  }
+
   const response = await fetchWithTimeout(endpoint(baseUrl, "/v1/chat/completions"), {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: analysisModel,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: JSON.stringify(context, null, 2) },
-      ],
-      temperature: 0.2,
-      response_format: { type: "json_object" },
-    }),
+    body: JSON.stringify(upstreamPayload),
   }, 20_000);
   const text = await response.text();
-  if (!response.ok) throw detailFromUpstream(response.status, text);
+  if (!response.ok) {
+    const detail = detailFromUpstream(response.status, text);
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({ ok: false, status: response.status, detail }),
+      });
+    }
+    throw detail;
+  }
   const payload = parseMaybeJson(text);
   const choices = payload && typeof payload === "object" && Array.isArray((payload as { choices?: unknown }).choices)
     ? (payload as { choices: Array<Record<string, unknown>> }).choices
@@ -872,7 +955,13 @@ async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: Proxy
   if (!analysis || typeof analysis !== "object") {
     throw new Error("分析模型没有返回可解析的 JSON");
   }
-  return normalizeAnalysisPayload(analysis, analysisModel);
+  const normalizedAnalysis = normalizeAnalysisPayload(analysis, analysisModel);
+  if (requestId) {
+    updateRequestLog(requestId, {
+      responseBody: sanitizeForLog({ ok: true, status: response.status, raw: payload, analysis: normalizedAnalysis }),
+    });
+  }
+  return normalizedAnalysis;
 }
 
 async function readOpenAiImageResponse(response: Response, outputFormat: string): Promise<ImageResult> {
@@ -1001,6 +1090,16 @@ async function generateOpenAiImageEdit(baseUrl: string, apiKey: string, request:
       upstreamReferenceCount: references.length,
       upstreamReferenceMode: "multipart:image[]",
       upstreamSize: requestSize && requestSize !== "auto" ? requestSize : undefined,
+      upstreamRequest: sanitizeForLog({
+        model: request.model || "gpt-image-2",
+        prompt: fullPrompt(request),
+        n: 1,
+        response_format: "b64_json",
+        size: requestSize && requestSize !== "auto" ? requestSize : undefined,
+        quality: request.quality && request.quality !== "auto" ? request.quality : undefined,
+        output_format: outputFormat && outputFormat !== "png" ? outputFormat : undefined,
+        referenceImages: references,
+      }),
     });
   }
 
@@ -1058,6 +1157,7 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
       upstreamReferenceCount: referenceCount,
       upstreamReferenceMode: referenceMode,
       upstreamSize: typeof payload.size === "string" ? payload.size : undefined,
+      upstreamRequest: sanitizeForLog(payload),
     });
   }
   const response = await fetchWithTimeout(endpoint(baseUrl, path), {
@@ -1071,7 +1171,7 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
   return readOpenAiImageResponse(response, outputFormat);
 }
 
-async function generateOpenAiResponses(baseUrl: string, apiKey: string, request: GenerateRequest) {
+async function generateOpenAiResponses(baseUrl: string, apiKey: string, request: GenerateRequest, requestId?: string) {
   const outputFormat = request.outputFormat || "png";
   const imageTool: Record<string, unknown> = {
     type: "image_generation",
@@ -1080,48 +1180,67 @@ async function generateOpenAiResponses(baseUrl: string, apiKey: string, request:
   if (request.quality && request.quality !== "auto") imageTool.quality = request.quality;
   if (outputFormat) imageTool.output_format = outputFormat;
 
+  const upstreamPayload = {
+    model: request.model,
+    input: fullPrompt(request),
+    tools: [imageTool],
+  };
+  if (requestId) {
+    updateRequestLog(requestId, {
+      endpoint: "/v1/responses",
+      upstreamPayloadKeys: Object.keys(upstreamPayload),
+      upstreamRequest: sanitizeForLog(upstreamPayload),
+      upstreamSize: typeof imageTool.size === "string" ? imageTool.size : undefined,
+    });
+  }
   const response = await fetchWithTimeout(endpoint(baseUrl, "/v1/responses"), {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: request.model,
-      input: fullPrompt(request),
-      tools: [imageTool],
-    }),
+    body: JSON.stringify(upstreamPayload),
   });
   return readGenericJsonImageResponse(response, outputFormat);
 }
 
-async function generateGeminiNative(baseUrl: string, apiKey: string, request: GenerateRequest) {
+async function generateGeminiNative(baseUrl: string, apiKey: string, request: GenerateRequest, requestId?: string) {
   const references = Array.isArray(request.referenceImages) ? request.referenceImages : [];
   const outputFormat = request.outputFormat || "png";
   const parts = [
     { text: fullPrompt(request) },
     ...references.map(dataUrlToGeminiPart),
   ];
+  const upstreamPayload = {
+    contents: [{ role: "user", parts }],
+    generationConfig: {
+      responseModalities: ["TEXT", "IMAGE"],
+      imageConfig: {
+        aspectRatio: request.aspectRatio || "1:1",
+      },
+    },
+  };
+  if (requestId) {
+    updateRequestLog(requestId, {
+      endpoint: `/models/${modelName(request.model)}:generateContent`,
+      upstreamPayloadKeys: Object.keys(upstreamPayload),
+      upstreamReferenceCount: references.length,
+      upstreamReferenceMode: references.length ? "gemini:parts:inline_data" : "none",
+      upstreamRequest: sanitizeForLog(upstreamPayload),
+    });
+  }
   const response = await fetchWithTimeout(endpoint(baseUrl, `/models/${modelName(request.model)}:generateContent`), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": apiKey,
     },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts }],
-      generationConfig: {
-        responseModalities: ["TEXT", "IMAGE"],
-        imageConfig: {
-          aspectRatio: request.aspectRatio || "1:1",
-        },
-      },
-    }),
+    body: JSON.stringify(upstreamPayload),
   });
   return readGenericJsonImageResponse(response, outputFormat);
 }
 
-async function generateImagen(baseUrl: string, apiKey: string, request: GenerateRequest) {
+async function generateImagen(baseUrl: string, apiKey: string, request: GenerateRequest, requestId?: string) {
   const outputFormat = request.outputFormat || "png";
   const parameters: Record<string, unknown> = {
     sampleCount: 1,
@@ -1131,21 +1250,29 @@ async function generateImagen(baseUrl: string, apiKey: string, request: Generate
   if (request.negativePrompt) parameters.negativePrompt = request.negativePrompt;
   if (request.seed) parameters.seed = Number.isFinite(Number(request.seed)) ? Number(request.seed) : request.seed;
 
+  const upstreamPayload = {
+    instances: [{ prompt: request.prompt }],
+    parameters,
+  };
+  if (requestId) {
+    updateRequestLog(requestId, {
+      endpoint: `/models/${modelName(request.model)}:predict`,
+      upstreamPayloadKeys: Object.keys(upstreamPayload),
+      upstreamRequest: sanitizeForLog(upstreamPayload),
+    });
+  }
   const response = await fetchWithTimeout(endpoint(baseUrl, `/models/${modelName(request.model)}:predict`), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       "x-goog-api-key": apiKey,
     },
-    body: JSON.stringify({
-      instances: [{ prompt: request.prompt }],
-      parameters,
-    }),
+    body: JSON.stringify(upstreamPayload),
   });
   return readGenericJsonImageResponse(response, outputFormat);
 }
 
-async function generateStability(baseUrl: string, apiKey: string, request: GenerateRequest) {
+async function generateStability(baseUrl: string, apiKey: string, request: GenerateRequest, requestId?: string) {
   const outputFormat = request.outputFormat === "jpeg" ? "jpeg" : request.outputFormat || "png";
   const form = new FormData();
   form.append("prompt", request.prompt || "");
@@ -1157,6 +1284,19 @@ async function generateStability(baseUrl: string, apiKey: string, request: Gener
   const path = String(request.model || "").includes("ultra")
     ? "/v2beta/stable-image/generate/ultra"
     : "/v2beta/stable-image/generate/core";
+  if (requestId) {
+    updateRequestLog(requestId, {
+      endpoint: path,
+      upstreamPayloadKeys: ["prompt", "output_format", ...(request.aspectRatio ? ["aspect_ratio"] : []), ...(request.negativePrompt ? ["negative_prompt"] : []), ...(request.seed ? ["seed"] : [])],
+      upstreamRequest: sanitizeForLog({
+        prompt: request.prompt || "",
+        output_format: outputFormat,
+        aspect_ratio: request.aspectRatio,
+        negative_prompt: request.negativePrompt,
+        seed: request.seed,
+      }),
+    });
+  }
   const response = await fetchWithTimeout(endpoint(baseUrl, path), {
     method: "POST",
     headers: {
@@ -1452,6 +1592,12 @@ function imageProxyPlugin(): PluginOption {
             agentScenario: getString(body, "agentScenario") ? truncateText(getString(body, "agentScenario"), 240) : undefined,
             promptVariant: getString(body, "promptVariant") || undefined,
             referenceCount: getNumber(body.referenceCount) || 0,
+            requestParams: sanitizeForLog({
+              ...body,
+              baseUrl,
+              apiKey: undefined,
+              credential: apiKeyLogMeta(apiKey),
+            }),
             status: "running",
             createdAt: startedAt,
             startedAt,
@@ -1459,7 +1605,7 @@ function imageProxyPlugin(): PluginOption {
           });
           logCreated = true;
 
-          const analysis = await analyzePromptWithGpt(baseUrl, apiKey, body);
+          const analysis = await analyzePromptWithGpt(baseUrl, apiKey, body, requestId);
           const finishedAt = Date.now();
           updateRequestLog(requestId, {
             status: "success",
@@ -1483,6 +1629,7 @@ function imageProxyPlugin(): PluginOption {
               errorType: summary.type || "prompt_analysis_error",
               errorCode: summary.code,
               errorRaw: summary.raw,
+              responseBody: sanitizeForLog({ ok: false, status, detail }),
               finishedAt,
               durationMs: finishedAt - startedAt,
             });
@@ -1546,6 +1693,12 @@ function imageProxyPlugin(): PluginOption {
             agentScenario: typeof requestMeta.agentScenario === "string" ? truncateText(requestMeta.agentScenario, 240) : undefined,
             promptVariant: typeof requestMeta.promptVariant === "string" ? requestMeta.promptVariant : undefined,
             referenceCount: Array.isArray(request.referenceImages) ? request.referenceImages.length : 0,
+            requestParams: sanitizeForLog({
+              ...body,
+              baseUrl,
+              apiKey: undefined,
+              credential: apiKeyLogMeta(apiKey),
+            }),
             status: "running",
             createdAt: startedAt,
             startedAt,
@@ -1560,6 +1713,7 @@ function imageProxyPlugin(): PluginOption {
               httpStatus: status,
               errorMessage: message,
               errorType: "validation_error",
+              responseBody: sanitizeForLog({ ok: false, requestId, detail: { error: message } }),
               finishedAt,
               durationMs: finishedAt - startedAt,
             });
@@ -1577,13 +1731,13 @@ function imageProxyPlugin(): PluginOption {
           }
 
           const result = protocol === "openai-responses"
-            ? await generateOpenAiResponses(baseUrl, apiKey, request)
+            ? await generateOpenAiResponses(baseUrl, apiKey, request, requestId)
             : protocol === "gemini-native"
-              ? await generateGeminiNative(baseUrl, apiKey, request)
+              ? await generateGeminiNative(baseUrl, apiKey, request, requestId)
               : protocol === "google-imagen"
-                ? await generateImagen(baseUrl, apiKey, request)
+                ? await generateImagen(baseUrl, apiKey, request, requestId)
                 : protocol === "stability-core"
-                  ? await generateStability(baseUrl, apiKey, request)
+                  ? await generateStability(baseUrl, apiKey, request, requestId)
                   : await generateOpenAiCompatible(baseUrl, apiKey, request, requestId);
 
           const finishedAt = Date.now();
@@ -1592,6 +1746,7 @@ function imageProxyPlugin(): PluginOption {
             updateRequestLog(requestId, {
               status: "success",
               httpStatus: result.status || 200,
+              responseBody: sanitizeForLog(result),
               finishedAt,
               durationMs,
             });
@@ -1604,6 +1759,7 @@ function imageProxyPlugin(): PluginOption {
               errorType: summary.type,
               errorCode: summary.code,
               errorRaw: summary.raw,
+              responseBody: sanitizeForLog(result),
               finishedAt,
               durationMs,
             });
@@ -1619,7 +1775,8 @@ function imageProxyPlugin(): PluginOption {
               httpStatus: 500,
               errorMessage: truncateText(message, 800),
               errorType: "proxy_error",
-              errorRaw: truncateText(message, 2500),
+              errorRaw: redactImageText(message, 2500),
+              responseBody: sanitizeForLog({ ok: false, detail: { error: message } }),
               finishedAt,
               durationMs: finishedAt - startedAt,
             });

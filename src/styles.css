@@ -1092,6 +1092,34 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
+.admin-log-row {
+  cursor: pointer;
+}
+
+.admin-log-row:hover td {
+  background: #fbfbf8;
+}
+
+.admin-log-row.expanded td {
+  background: #f7fffc;
+}
+
+.admin-status-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.admin-status-cell svg {
+  color: var(--muted);
+  transition: transform 150ms ease;
+}
+
+.admin-log-row.expanded .admin-status-cell svg {
+  color: var(--green);
+  transform: rotate(90deg);
+}
+
 .admin-status {
   display: inline-flex;
   align-items: center;
@@ -1141,6 +1169,83 @@ textarea:focus-visible {
   color: var(--muted);
   text-align: center !important;
   vertical-align: middle !important;
+}
+
+.admin-log-detail-row td {
+  padding: 0;
+  background: #f7fffc;
+}
+
+.admin-log-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-bottom: 1px solid #d4eee6;
+}
+
+.admin-log-detail-head strong,
+.admin-log-detail-head span {
+  display: block;
+}
+
+.admin-log-detail-head strong {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 850;
+}
+
+.admin-log-detail-head span {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.admin-log-safety {
+  flex: 0 0 auto;
+  min-height: 24px;
+  padding: 5px 8px;
+  border: 1px solid #b8ded2;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--green) !important;
+  font-weight: 800;
+}
+
+.admin-log-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  padding: 12px;
+}
+
+.admin-json-block {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.admin-json-block > strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.admin-json-block pre {
+  max-height: 360px;
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.9);
+  color: #373832;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .history-title {
@@ -4928,6 +5033,15 @@ textarea:focus-visible {
 
   .admin-filter-row input {
     width: 100%;
+  }
+
+  .admin-log-detail-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-log-detail-head {
+    align-items: flex-start;
+    flex-direction: column;
   }
 
   .home-feature-grid {

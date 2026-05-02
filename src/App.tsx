@@ -33,6 +33,7 @@ import {
   type CSSProperties,
   type ChangeEvent,
   type DragEvent,
+  Fragment,
   type FormEvent,
   memo,
   useEffect,
@@ -363,6 +364,9 @@ type AdminRequestLog = {
   upstreamReferenceCount?: number;
   upstreamReferenceMode?: string;
   upstreamSize?: string;
+  requestParams?: unknown;
+  upstreamRequest?: unknown;
+  responseBody?: unknown;
   status: "running" | "success" | "error";
   httpStatus?: number;
   errorMessage?: string;
@@ -1910,13 +1914,48 @@ function truncateForLog(value: string, limit = LOG_TEXT_LIMIT) {
   return `${value.slice(0, limit)}...(${value.length} chars)`;
 }
 
+function sanitizeClientLogValue(value: unknown, key = "", depth = 0): unknown {
+  const lowerKey = key.toLowerCase();
+  if (depth > 8) return "[depth-limit]";
+  if (value === null || value === undefined) return value;
+  if (lowerKey === "apikey" || lowerKey === "api_key" || lowerKey === "authorization" || lowerKey === "password" || lowerKey === "token") {
+    return "[redacted]";
+  }
+  if (typeof value === "string") {
+    if (
+      value.startsWith("data:image/")
+      || lowerKey === "dataurl"
+      || lowerKey === "thumbnaildataurl"
+      || lowerKey === "b64_json"
+      || (lowerKey === "data" && value.length > 180 && /^[A-Za-z0-9+/=\r\n]+$/.test(value))
+    ) {
+      return `[image-data-redacted:${value.length} chars]`;
+    }
+    return truncateForLog(value, 4000);
+  }
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    return value.slice(0, 80).map((item) => sanitizeClientLogValue(item, key, depth + 1));
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(
+      Object.entries(record).map(([entryKey, entryValue]) => [
+        entryKey,
+        sanitizeClientLogValue(entryValue, entryKey, depth + 1),
+      ]),
+    );
+  }
+  return String(value);
+}
+
 function safeLogError(error: unknown) {
   if (error instanceof Error) {
     return { name: error.name, message: error.message };
   }
   if (!error || typeof error !== "object") return error;
   try {
-    return JSON.parse(JSON.stringify(error));
+    return sanitizeClientLogValue(JSON.parse(JSON.stringify(error)));
   } catch {
     return String(error);
   }
@@ -3426,6 +3465,7 @@ export default function App() {
           height,
           revisedPrompt: truncateForLog(revisedPrompt || "", 500),
           imageCount: payload.images.length,
+          proxyResponse: sanitizeClientLogValue(payload),
         },
       });
 
@@ -3660,6 +3700,7 @@ export default function App() {
           riskLevel: result.riskLevel,
           safe: result.safe,
           source: result.source,
+          analysis: sanitizeClientLogValue(result),
         },
       });
       return result;
@@ -5532,6 +5573,7 @@ function AdminApp({
   const [logStatus, setLogStatus] = useState("");
   const [logQuery, setLogQuery] = useState("");
   const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+  const [expandedLogId, setExpandedLogId] = useState("");
 
   useEffect(() => {
     void refreshMe();
@@ -5627,6 +5669,9 @@ function AdminApp({
       ]);
       setStats(statsPayload.stats);
       setLogs(logsPayload.logs);
+      setExpandedLogId((current) =>
+        logsPayload.logs.some((log) => log.requestId === current) ? current : "",
+      );
     } catch (error) {
       setAdminError(formatError(error));
       if ((error as { mustChangePassword?: boolean })?.mustChangePassword) {
@@ -5828,7 +5873,7 @@ function AdminApp({
         <div className="admin-log-toolbar">
           <div>
             <strong>请求记录</strong>
-            <span>只记录 requestID、提示词、模型、参数、状态与错误信息</span>
+            <span>点击任意请求可查看脱敏请求参数、上游 payload 与返回内容；图片内容不会记录。</span>
           </div>
           <div className="admin-filter-row">
             <select value={logStatus} onChange={(event) => setLogStatus(event.target.value)}>
@@ -5870,35 +5915,95 @@ function AdminApp({
                 </tr>
               ) : (
                 logs.map((log) => (
-                  <tr key={log.requestId}>
-                    <td><span className={`admin-status ${log.status}`}>{log.status}</span></td>
-                    <td>{log.requestType === "prompt_analysis" ? "提示词分析" : "生图"}</td>
-                    <td className="admin-model-cell" title={log.agentScenario || ""}>
-                      {log.agentName ? `${log.agentName}${log.promptVariant ? ` · ${log.promptVariant}` : ""}` : "-"}
-                    </td>
-                    <td><code title={log.requestId}>{log.requestId.slice(0, 8)}</code></td>
-                    <td className="admin-prompt-cell" title={log.prompt}>{log.prompt || "-"}</td>
-                    <td className="admin-model-cell" title={log.model}>{log.model || "-"}</td>
-                    <td
-                      title={[
-                        `API：${log.apiBaseUrl}`,
-                        `Key：${log.apiKeyPresent ? `${log.apiKeyPrefix || ""}...${log.apiKeySuffix || ""} · ${log.apiKeyLength || 0} 位` : "未读取到"}`,
-                        log.upstreamPayloadKeys?.length ? `上游字段：${log.upstreamPayloadKeys.join(", ")}` : "",
-                        log.upstreamReferenceMode ? `参考图模式：${log.upstreamReferenceMode}` : "",
-                      ].filter(Boolean).join("\n")}
+                  <Fragment key={log.requestId}>
+                    <tr
+                      className={`admin-log-row ${expandedLogId === log.requestId ? "expanded" : ""}`}
+                      onClick={() => setExpandedLogId((current) => current === log.requestId ? "" : log.requestId)}
                     >
-                      {[
-                        log.aspectRatio,
-                        log.resolution,
-                        log.upstreamSize ? `上游 ${log.upstreamSize}` : log.size,
-                        log.outputFormat,
-                        log.upstreamReferenceCount ? `上游 ${log.upstreamReferenceCount} 图` : log.referenceCount ? `${log.referenceCount} 图` : "",
-                      ].filter(Boolean).join(" · ") || "-"}
-                    </td>
-                    <td>{formatCompactDuration(log.durationMs || 0)}</td>
-                    <td>{formatFullDate(log.createdAt)}</td>
-                    <td className="admin-error-cell" title={log.errorRaw || log.errorMessage || ""}>{log.errorMessage || "-"}</td>
-                  </tr>
+                      <td>
+                        <div className="admin-status-cell">
+                          <ChevronRight size={14} />
+                          <span className={`admin-status ${log.status}`}>{log.status}</span>
+                        </div>
+                      </td>
+                      <td>{log.requestType === "prompt_analysis" ? "提示词分析" : "生图"}</td>
+                      <td className="admin-model-cell" title={log.agentScenario || ""}>
+                        {log.agentName ? `${log.agentName}${log.promptVariant ? ` · ${log.promptVariant}` : ""}` : "-"}
+                      </td>
+                      <td><code title={log.requestId}>{log.requestId.slice(0, 8)}</code></td>
+                      <td className="admin-prompt-cell" title={log.prompt}>{log.prompt || "-"}</td>
+                      <td className="admin-model-cell" title={log.model}>{log.model || "-"}</td>
+                      <td
+                        title={[
+                          `API：${log.apiBaseUrl}`,
+                          `Key：${log.apiKeyPresent ? `${log.apiKeyPrefix || ""}...${log.apiKeySuffix || ""} · ${log.apiKeyLength || 0} 位` : "未读取到"}`,
+                          log.upstreamPayloadKeys?.length ? `上游字段：${log.upstreamPayloadKeys.join(", ")}` : "",
+                          log.upstreamReferenceMode ? `参考图模式：${log.upstreamReferenceMode}` : "",
+                        ].filter(Boolean).join("\n")}
+                      >
+                        {[
+                          log.aspectRatio,
+                          log.resolution,
+                          log.upstreamSize ? `上游 ${log.upstreamSize}` : log.size,
+                          log.outputFormat,
+                          log.upstreamReferenceCount ? `上游 ${log.upstreamReferenceCount} 图` : log.referenceCount ? `${log.referenceCount} 图` : "",
+                        ].filter(Boolean).join(" · ") || "-"}
+                      </td>
+                      <td>{formatCompactDuration(log.durationMs || 0)}</td>
+                      <td>{formatFullDate(log.createdAt)}</td>
+                      <td className="admin-error-cell" title={log.errorRaw || log.errorMessage || ""}>{log.errorMessage || "-"}</td>
+                    </tr>
+                    {expandedLogId === log.requestId && (
+                      <tr className="admin-log-detail-row">
+                        <td colSpan={10}>
+                          <div className="admin-log-detail-head">
+                            <div>
+                              <strong>请求详情</strong>
+                              <span>{log.requestId} · {log.endpoint}</span>
+                            </div>
+                            <span className="admin-log-safety">图片内容已脱敏，不记录 API Key 原文</span>
+                          </div>
+                          <div className="admin-log-detail-grid">
+                            <AdminJsonBlock title="请求参数" value={log.requestParams || {
+                              protocol: log.protocol,
+                              apiBaseUrl: log.apiBaseUrl,
+                              credential: {
+                                present: log.apiKeyPresent,
+                                length: log.apiKeyLength,
+                                prefix: log.apiKeyPrefix,
+                                suffix: log.apiKeySuffix,
+                              },
+                              model: log.model,
+                              prompt: log.prompt,
+                              negativePrompt: log.negativePrompt,
+                              aspectRatio: log.aspectRatio,
+                              size: log.size,
+                              resolution: log.resolution,
+                              quality: log.quality,
+                              outputFormat: log.outputFormat,
+                              seed: log.seed,
+                              referenceCount: log.referenceCount,
+                            }} />
+                            <AdminJsonBlock title="上游请求" value={log.upstreamRequest || {
+                              endpoint: log.endpoint,
+                              payloadKeys: log.upstreamPayloadKeys,
+                              referenceMode: log.upstreamReferenceMode,
+                              referenceCount: log.upstreamReferenceCount,
+                              upstreamSize: log.upstreamSize,
+                            }} />
+                            <AdminJsonBlock title="返回内容" value={log.responseBody || {
+                              status: log.status,
+                              httpStatus: log.httpStatus,
+                              errorMessage: log.errorMessage,
+                              errorType: log.errorType,
+                              errorCode: log.errorCode,
+                              errorRaw: log.errorRaw,
+                            }} />
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))
               )}
             </tbody>
@@ -5922,6 +6027,15 @@ function AdminStatCard({
     <article className={`admin-stat-card ${tone}`}>
       <span>{label}</span>
       <strong>{value}</strong>
+    </article>
+  );
+}
+
+function AdminJsonBlock({ title, value }: { title: string; value: unknown }) {
+  return (
+    <article className="admin-json-block">
+      <strong>{title}</strong>
+      <pre>{JSON.stringify(value ?? {}, null, 2)}</pre>
     </article>
   );
 }
