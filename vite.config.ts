@@ -88,6 +88,10 @@ type RequestLog = {
   clientIpHash: string;
   protocol: ImageProtocol;
   apiBaseUrl: string;
+  apiKeyPresent?: boolean;
+  apiKeyLength?: number;
+  apiKeyPrefix?: string;
+  apiKeySuffix?: string;
   endpoint: string;
   model: string;
   prompt: string;
@@ -345,6 +349,16 @@ function hashClientIp(req: IncomingMessage) {
 function truncateText(value: unknown, max = 2000) {
   const text = typeof value === "string" ? value : JSON.stringify(value ?? "");
   return text.slice(0, max);
+}
+
+function apiKeyLogMeta(apiKey: string) {
+  const trimmed = apiKey.trim();
+  return {
+    apiKeyPresent: trimmed.length > 0,
+    apiKeyLength: trimmed.length,
+    apiKeyPrefix: trimmed ? trimmed.slice(0, 6) : undefined,
+    apiKeySuffix: trimmed.length > 4 ? trimmed.slice(-4) : undefined,
+  };
 }
 
 function normalizeAllowedApiBaseUrl(value: string) {
@@ -1423,6 +1437,7 @@ function imageProxyPlugin(): PluginOption {
             clientIpHash: hashClientIp(req),
             protocol,
             apiBaseUrl: baseUrl.replace(/\/+$/, ""),
+            ...apiKeyLogMeta(apiKey),
             endpoint: "/v1/chat/completions",
             model: truncateText(analysisModel || "", 240),
             prompt: truncateText(prompt || "", 4000),
@@ -1457,12 +1472,13 @@ function imageProxyPlugin(): PluginOption {
           const detail = error && typeof error === "object" && "error" in error
             ? error
             : { error: error instanceof Error ? error.message : String(error) };
+          const status = isAllowedApiBaseUrlError(error) ? 400 : httpStatusFromDetail(detail) || httpStatusFromDetail(error) || 500;
           if (logCreated) {
             const summary = safeErrorSummary(detail);
             const finishedAt = Date.now();
             updateRequestLog(requestId, {
               status: "error",
-              httpStatus: 500,
+              httpStatus: status,
               errorMessage: summary.message,
               errorType: summary.type || "prompt_analysis_error",
               errorCode: summary.code,
@@ -1471,7 +1487,7 @@ function imageProxyPlugin(): PluginOption {
               durationMs: finishedAt - startedAt,
             });
           }
-          sendJson(res, isAllowedApiBaseUrlError(error) ? 400 : 500, {
+          sendJson(res, status, {
             ok: false,
             requestId,
             detail,
@@ -1510,6 +1526,7 @@ function imageProxyPlugin(): PluginOption {
             clientIpHash: hashClientIp(req),
             protocol,
             apiBaseUrl: baseUrl.replace(/\/+$/, ""),
+            ...apiKeyLogMeta(apiKey),
             endpoint: generationEndpointLabel(
               protocol,
               request.model,

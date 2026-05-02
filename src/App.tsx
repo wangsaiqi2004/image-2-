@@ -84,6 +84,7 @@ type UploadedReference = {
   type: string;
   size: number;
   dataUrl: string;
+  thumbnailDataUrl?: string;
   width?: number;
   height?: number;
   status?: ReferenceStatus;
@@ -157,6 +158,24 @@ type HistoryRecord = Omit<StoredHistoryRecord, "referenceImages"> & {
 type ModelLoadState = {
   status: "idle" | "loading" | "ready" | "error";
   message: string;
+};
+
+type LocalLogLevel = "info" | "success" | "warning" | "error";
+type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation";
+
+type LocalLogEntry = {
+  id: string;
+  createdAt: number;
+  type: LocalLogType;
+  level: LocalLogLevel;
+  title: string;
+  message: string;
+  endpoint?: string;
+  requestId?: string;
+  durationMs?: number;
+  params?: Record<string, unknown>;
+  response?: Record<string, unknown>;
+  error?: unknown;
 };
 
 type GenerateProxyResponse = {
@@ -321,6 +340,10 @@ type AdminRequestLog = {
   clientIpHash: string;
   protocol: ImageProtocol;
   apiBaseUrl: string;
+  apiKeyPresent?: boolean;
+  apiKeyLength?: number;
+  apiKeyPrefix?: string;
+  apiKeySuffix?: string;
   endpoint: string;
   model: string;
   prompt: string;
@@ -1087,6 +1110,10 @@ const fullDateTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
   second: "2-digit",
 });
 
+const LOCAL_LOG_STORAGE_KEY = "imageStudioLocalRequestLogs";
+const LOCAL_LOG_LIMIT = 200;
+const LOG_TEXT_LIMIT = 800;
+
 function uid() {
   return crypto.randomUUID();
 }
@@ -1184,6 +1211,9 @@ function normalizeStoredReferenceImages(value: unknown): UploadedReference[] {
       type: typeof record.type === "string" && record.type ? record.type : "image/png",
       size: typeof record.size === "number" && Number.isFinite(record.size) ? record.size : 0,
       dataUrl,
+      thumbnailDataUrl: typeof record.thumbnailDataUrl === "string" && record.thumbnailDataUrl
+        ? record.thumbnailDataUrl
+        : dataUrl,
       width: typeof record.width === "number" ? record.width : undefined,
       height: typeof record.height === "number" ? record.height : undefined,
       status,
@@ -1195,6 +1225,14 @@ function normalizeStoredReferenceImages(value: unknown): UploadedReference[] {
 
 function referenceImagesForHistory(images: UploadedReference[]) {
   return normalizeStoredReferenceImages(images).map((image) => ({ ...image }));
+}
+
+function referenceImagesForRequest(images: UploadedReference[]) {
+  return images.map((image) => ({
+    name: image.name,
+    type: image.type,
+    dataUrl: image.dataUrl,
+  }));
 }
 
 function sanitizeFilename(value: string) {
@@ -1590,6 +1628,36 @@ function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+function createReferenceThumbnail(dataUrl: string, maxEdge = 160): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      const longestEdge = Math.max(image.naturalWidth, image.naturalHeight);
+      const scale = longestEdge > 0 ? Math.min(1, maxEdge / longestEdge) : 1;
+      const width = Math.max(1, Math.round(image.naturalWidth * scale));
+      const height = Math.max(1, Math.round(image.naturalHeight * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d", { alpha: true });
+      if (!context) {
+        reject(new Error("无法创建缩略图"));
+        return;
+      }
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "medium";
+      context.drawImage(image, 0, 0, width, height);
+      try {
+        resolve(canvas.toDataURL("image/webp", 0.72));
+      } catch {
+        resolve(canvas.toDataURL("image/png"));
+      }
+    };
+    image.onerror = () => reject(new Error("无法读取参考图缩略图"));
+    image.src = dataUrl;
+  });
+}
+
 async function fileToReference(file: File): Promise<UploadedReference> {
   const type = normalizeImageType(file);
   const baseReference = {
@@ -1656,6 +1724,13 @@ async function fileToReference(file: File): Promise<UploadedReference> {
     };
   }
 
+  let thumbnailDataUrl = dataUrl;
+  try {
+    thumbnailDataUrl = await createReferenceThumbnail(dataUrl);
+  } catch {
+    thumbnailDataUrl = dataUrl;
+  }
+
   const shortestEdge = Math.min(dimensions.width, dimensions.height);
   const longestEdge = Math.max(dimensions.width, dimensions.height);
   if (shortestEdge < MIN_REFERENCE_EDGE) {
@@ -1663,6 +1738,7 @@ async function fileToReference(file: File): Promise<UploadedReference> {
       ...baseReference,
       ...dimensions,
       dataUrl,
+      thumbnailDataUrl,
       status: "error",
       message: `短边小于 ${MIN_REFERENCE_EDGE}px`,
     };
@@ -1673,6 +1749,7 @@ async function fileToReference(file: File): Promise<UploadedReference> {
       ...baseReference,
       ...dimensions,
       dataUrl,
+      thumbnailDataUrl,
       status: "warning",
       message: "尺寸较大",
     };
@@ -1682,6 +1759,7 @@ async function fileToReference(file: File): Promise<UploadedReference> {
     ...baseReference,
     ...dimensions,
     dataUrl,
+    thumbnailDataUrl,
     status: "ready",
     message: "可用",
   };
@@ -1825,6 +1903,70 @@ function loadBooleanSetting(key: string, fallback: boolean) {
   if (raw === "true") return true;
   if (raw === "false") return false;
   return fallback;
+}
+
+function truncateForLog(value: string, limit = LOG_TEXT_LIMIT) {
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}...(${value.length} chars)`;
+}
+
+function safeLogError(error: unknown) {
+  if (error instanceof Error) {
+    return { name: error.name, message: error.message };
+  }
+  if (!error || typeof error !== "object") return error;
+  try {
+    return JSON.parse(JSON.stringify(error));
+  } catch {
+    return String(error);
+  }
+}
+
+function maskApiKeyForLog(apiKey: string, rememberKey: boolean) {
+  const trimmed = apiKey.trim();
+  return {
+    present: trimmed.length > 0,
+    length: trimmed.length,
+    prefix: trimmed ? trimmed.slice(0, 6) : "",
+    suffix: trimmed.length > 4 ? trimmed.slice(-4) : "",
+    source: trimmed
+      ? rememberKey
+        ? "localStorage:imageStudioApiKey"
+        : "sessionStorage:imageStudioApiKey"
+      : "empty",
+  };
+}
+
+function referenceMetaForLog(images: UploadedReference[]) {
+  return images.map((image) => ({
+    id: image.id,
+    name: image.name,
+    type: image.type,
+    size: image.size,
+    width: image.width,
+    height: image.height,
+    status: image.status || "ready",
+    hasDataUrl: Boolean(image.dataUrl),
+  }));
+}
+
+function loadLocalLogs(): LocalLogEntry[] {
+  const raw = localStorage.getItem(LOCAL_LOG_STORAGE_KEY);
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(0, LOCAL_LOG_LIMIT) as LocalLogEntry[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveLocalLogs(logs: LocalLogEntry[]) {
+  try {
+    localStorage.setItem(LOCAL_LOG_STORAGE_KEY, JSON.stringify(logs.slice(0, LOCAL_LOG_LIMIT)));
+  } catch {
+    // Local request logs are diagnostic only. Ignore quota failures.
+  }
 }
 
 function loadInitialApiConfig(): ApiConfig {
@@ -2286,11 +2428,14 @@ export default function App() {
     localStorage.getItem("imageStudioAgentHintSeen") === "true",
   );
   const [isAgentHintVisible, setIsAgentHintVisible] = useState(false);
-  const [selectedAgentId, setSelectedAgentId] = useState(INDUSTRY_AGENTS[0]?.id || "");
-  const [agentValues, setAgentValues] = useState<Record<string, string>>(() => createAgentDefaults(INDUSTRY_AGENTS[0]));
+  const [isAgentQuickbarExpanded, setIsAgentQuickbarExpanded] = useState(false);
+  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [agentValues, setAgentValues] = useState<Record<string, string>>({});
   const [agentPlan, setAgentPlan] = useState<AgentPlan | null>(null);
   const [agentPhase, setAgentPhase] = useState<AgentRunPhase>("collecting");
   const [agentAutoApplySeconds, setAgentAutoApplySeconds] = useState<number | null>(null);
+  const [localLogs, setLocalLogs] = useState<LocalLogEntry[]>(loadLocalLogs);
+  const [isLocalLogOpen, setIsLocalLogOpen] = useState(false);
   const [analysisCountdown, setAnalysisCountdown] = useState<AnalysisCountdown | null>(null);
   const [isComposerCollapsed, setIsComposerCollapsed] = useState(false);
   const [isBulkDownloading, setIsBulkDownloading] = useState(false);
@@ -2325,6 +2470,7 @@ export default function App() {
   const lastAutoModelLoadKeyRef = useRef("");
   const analysisCountdownTimerRef = useRef<number | undefined>(undefined);
   const composerCollapseTimerRef = useRef<number | undefined>(undefined);
+  const scrollFrameRef = useRef<number | undefined>(undefined);
   const protocolDefinition = getProtocolDefinition(apiConfig.protocol);
   const currentApiConnectionKey = apiConnectionKey(apiConfig);
   const isModelConnectionVerified = modelState.status === "ready" && verifiedModelKey === currentApiConnectionKey;
@@ -2380,9 +2526,11 @@ export default function App() {
   const failedVisibleRecordCount = visibleStats.error;
   const isPromptAnalyzing = analysisState.status === "analyzing";
   const selectedAgent = useMemo(
-    () => INDUSTRY_AGENTS.find((agent) => agent.id === selectedAgentId) || INDUSTRY_AGENTS[0],
+    () => INDUSTRY_AGENTS.find((agent) => agent.id === selectedAgentId) || null,
     [selectedAgentId],
   );
+  const isAgentEnabled = Boolean(selectedAgent);
+  const latestLocalLogLevel = localLogs[0]?.level;
   const modelStatusMessage = isAutoLoadingModels
     ? "正在自动验证 API Key 并读取 image-2 模型..."
     : isModelConnectionVerified && verifiedModelAt
@@ -2549,6 +2697,9 @@ export default function App() {
       }
       if (composerCollapseTimerRef.current) {
         window.clearTimeout(composerCollapseTimerRef.current);
+      }
+      if (scrollFrameRef.current) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
       }
     };
   }, []);
@@ -2914,6 +3065,54 @@ export default function App() {
     void handleFiles(event.dataTransfer.files);
   }
 
+  function apiLogSnapshot(config = apiConfig) {
+    return {
+      protocol: config.protocol,
+      baseUrl: normalizeApiBaseUrl(config.baseUrl),
+      apiKey: maskApiKeyForLog(config.apiKey, config.rememberKey),
+    };
+  }
+
+  function pushLocalLog(entry: Omit<LocalLogEntry, "id" | "createdAt">) {
+    setLocalLogs((current) => {
+      const next = [{ id: uid(), createdAt: Date.now(), ...entry }, ...current].slice(0, LOCAL_LOG_LIMIT);
+      saveLocalLogs(next);
+      return next;
+    });
+  }
+
+  function clearLocalLogs() {
+    saveLocalLogs([]);
+    setLocalLogs([]);
+  }
+
+  function imageRequestParamsForLog(job: Job, config: ApiConfig) {
+    return {
+      ...apiLogSnapshot(config),
+      request: {
+        batchId: job.batchId,
+        index: job.index,
+        total: job.total,
+        protocol: job.protocol,
+        model: job.model,
+        prompt: truncateForLog(job.prompt),
+        aspectRatio: job.params.aspectRatio,
+        size: job.params.size || resolveSize(job.params.aspectRatio, job.params.resolution),
+        resolution: job.params.resolution,
+        quality: job.params.quality,
+        outputFormat: job.params.outputFormat,
+        seed: job.params.seed,
+        negativePrompt: truncateForLog(job.params.negativePrompt || "", 400),
+        agentId: job.agentId,
+        agentName: job.agentName,
+        agentScenario: job.agentScenario,
+        promptVariant: job.promptVariant,
+        referenceCount: job.referenceImages.length,
+        referenceImages: referenceMetaForLog(job.referenceImages),
+      },
+    };
+  }
+
   async function loadModels({
     silent = false,
     config = apiConfig,
@@ -2923,6 +3122,7 @@ export default function App() {
   } = {}): Promise<boolean> {
     const normalizedBaseUrl = normalizeApiBaseUrl(config.baseUrl);
     const modelLoadKey = `${config.protocol}|${normalizedBaseUrl}|${config.apiKey.trim()}`;
+    const startedAt = Date.now();
     if (config.apiKey.trim().length < API_KEY_MIN_LENGTH) {
       setVerifiedModelKey("");
       setVerifiedModelAt(0);
@@ -2931,6 +3131,15 @@ export default function App() {
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "error", message: "请先填写有效的 API Key" });
+      pushLocalLog({
+        type: "model_load",
+        level: "error",
+        title: silent ? "自动读取模型失败" : "读取模型失败",
+        message: "API Key 为空或长度不足，已阻止请求上游。",
+        endpoint: "/api/models",
+        durationMs: 0,
+        params: apiLogSnapshot(config),
+      });
       return false;
     }
     const requestId = modelLoadRequestRef.current + 1;
@@ -2945,6 +3154,14 @@ export default function App() {
       setIsAutoLoadingModels(false);
       setModelState({ status: "loading", message: "正在验证 API Key 并读取模型" });
     }
+    pushLocalLog({
+      type: "model_load",
+      level: "info",
+      title: silent ? "自动读取模型" : "读取模型列表",
+      message: "正在通过 /api/models 验证 API Key 并读取模型列表。",
+      endpoint: "/api/models",
+      params: apiLogSnapshot(config),
+    });
     try {
       const response = await fetch("/api/models", {
         method: "POST",
@@ -2980,6 +3197,21 @@ export default function App() {
       setSelectedAnalysisModel(nextSelectedAnalysisModel);
       setModelFilter("");
       setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个 image-2 模型` });
+      pushLocalLog({
+        type: "model_load",
+        level: "success",
+        title: silent ? "自动读取模型成功" : "读取模型成功",
+        message: `已读取 ${nextModels.length} 个 image-2 模型，选中 ${nextSelectedModel}。`,
+        endpoint: "/api/models",
+        durationMs: Date.now() - startedAt,
+        params: apiLogSnapshot(config),
+        response: {
+          modelCount: nextModels.length,
+          analysisModelCount: nextAnalysisModels.length,
+          selectedModel: nextSelectedModel,
+          selectedAnalysisModel: nextSelectedAnalysisModel,
+        },
+      });
       if (silent && showOnboarding && onboardingStep < 2) {
         setOnboardingStep(2);
       }
@@ -2993,6 +3225,16 @@ export default function App() {
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "error", message: modelValidationErrorMessage(error) });
+      pushLocalLog({
+        type: "model_load",
+        level: "error",
+        title: silent ? "自动读取模型失败" : "读取模型失败",
+        message: modelValidationErrorMessage(error),
+        endpoint: "/api/models",
+        durationMs: Date.now() - startedAt,
+        params: apiLogSnapshot(config),
+        error: safeLogError(error),
+      });
       return false;
     } finally {
       if (silent) {
@@ -3003,6 +3245,7 @@ export default function App() {
 
   async function verifyApiKeyBeforeGeneration() {
     const modelLoadKey = apiConnectionKey(apiConfig);
+    const startedAt = Date.now();
     if (apiConfig.apiKey.trim().length < API_KEY_MIN_LENGTH) {
       setVerifiedModelKey("");
       setVerifiedModelAt(0);
@@ -3011,11 +3254,28 @@ export default function App() {
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "error", message: "请先填写有效的 API Key" });
+      pushLocalLog({
+        type: "api_health",
+        level: "error",
+        title: "提交前验证失败",
+        message: "API Key 为空或长度不足，已阻止生成。",
+        endpoint: "/api/models",
+        durationMs: 0,
+        params: apiLogSnapshot(),
+      });
       return false;
     }
 
     setIsAutoLoadingModels(false);
     setModelState({ status: "loading", message: "提交前验证 API Key" });
+    pushLocalLog({
+      type: "api_health",
+      level: "info",
+      title: "提交前验证 API Key",
+      message: "生成前先请求模型列表，避免无效 Key 进入生图链路。",
+      endpoint: "/api/models",
+      params: apiLogSnapshot(),
+    });
     try {
       const response = await fetch("/api/models", {
         method: "POST",
@@ -3042,9 +3302,36 @@ export default function App() {
       if (!nextModels.includes(selectedModel)) {
         setSelectedModel(preferModel(nextModels, selectedModel));
         setModelState({ status: "ready", message: "模型列表已刷新，请再次点击生成" });
+        pushLocalLog({
+          type: "api_health",
+          level: "warning",
+          title: "提交前验证通过但模型已刷新",
+          message: "当前选中模型不在最新 image-2 模型列表中，已自动改选，需要用户再次确认生成。",
+          endpoint: "/api/models",
+          durationMs: Date.now() - startedAt,
+          params: apiLogSnapshot(),
+          response: {
+            modelCount: nextModels.length,
+            selectedModel,
+            nextSelectedModel: preferModel(nextModels, selectedModel),
+          },
+        });
         return false;
       }
       setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个 image-2 模型` });
+      pushLocalLog({
+        type: "api_health",
+        level: "success",
+        title: "提交前验证通过",
+        message: `API Key 可用，已确认 ${nextModels.length} 个 image-2 模型。`,
+        endpoint: "/api/models",
+        durationMs: Date.now() - startedAt,
+        params: apiLogSnapshot(),
+        response: {
+          modelCount: nextModels.length,
+          selectedModel,
+        },
+      });
       return true;
     } catch (error) {
       setVerifiedModelKey("");
@@ -3054,20 +3341,39 @@ export default function App() {
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "error", message: modelValidationErrorMessage(error) });
+      pushLocalLog({
+        type: "api_health",
+        level: "error",
+        title: "提交前验证失败",
+        message: modelValidationErrorMessage(error),
+        endpoint: "/api/models",
+        durationMs: Date.now() - startedAt,
+        params: apiLogSnapshot(),
+        error: safeLogError(error),
+      });
       return false;
     }
   }
 
   async function generateSingle(job: Job, config: ApiConfig) {
     const startedAt = Date.now();
+    const requestParamsForLog = imageRequestParamsForLog(job, config);
     patchVisibleRecord(job.id, { status: "running", startedAt, durationMs: 0 });
+    pushLocalLog({
+      type: "image_generation",
+      level: "info",
+      title: `开始生成图片 #${job.index}/${job.total}`,
+      message: `模型 ${job.model}，参考图 ${job.referenceImages.length} 张。`,
+      endpoint: "/api/images/generate",
+      params: requestParamsForLog,
+    });
 
     try {
       const response = await fetch("/api/images/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          baseUrl: config.baseUrl,
+          baseUrl: normalizeApiBaseUrl(config.baseUrl),
           apiKey: config.apiKey,
           clientId: getClientId(),
           request: {
@@ -3088,7 +3394,7 @@ export default function App() {
             agentName: job.agentName,
             agentScenario: job.agentScenario,
             promptVariant: job.promptVariant,
-            referenceImages: job.referenceImages,
+            referenceImages: referenceImagesForRequest(job.referenceImages),
           },
         }),
       });
@@ -3106,6 +3412,22 @@ export default function App() {
       const finishedAt = Date.now();
       const durationMs = finishedAt - startedAt;
       const revisedPrompt = payload.images[0].revisedPrompt || "";
+      pushLocalLog({
+        type: "image_generation",
+        level: "success",
+        title: `图片生成成功 #${job.index}/${job.total}`,
+        message: `生成完成，尺寸 ${width} x ${height}。`,
+        endpoint: "/api/images/generate",
+        requestId: payload.requestId,
+        durationMs,
+        params: requestParamsForLog,
+        response: {
+          width,
+          height,
+          revisedPrompt: truncateForLog(revisedPrompt || "", 500),
+          imageCount: payload.images.length,
+        },
+      });
 
       patchVisibleRecord(job.id, {
         requestId: payload.requestId,
@@ -3158,6 +3480,17 @@ export default function App() {
       const requestId = errorDetail && typeof errorDetail === "object" && "requestId" in errorDetail
         ? String((errorDetail as { requestId?: unknown }).requestId || "")
         : undefined;
+      pushLocalLog({
+        type: "image_generation",
+        level: "error",
+        title: `图片生成失败 #${job.index}/${job.total}`,
+        message: formatError(errorDetail),
+        endpoint: "/api/images/generate",
+        requestId,
+        durationMs,
+        params: requestParamsForLog,
+        error: safeLogError(errorDetail),
+      });
       patchVisibleRecord(job.id, { requestId, status: "error", errorDetail, startedAt, finishedAt, durationMs });
       const historyRecord: StoredHistoryRecord = {
         id: job.id,
@@ -3218,6 +3551,19 @@ export default function App() {
     const fallback = analysisFallback(mode, promptText, analysisParams, analysisReferences);
     const analysisModel = preferAnalysisModel(analysisModels, selectedAnalysisModel);
     if (!analysisModel || !apiConfig.apiKey.trim()) {
+      pushLocalLog({
+        type: "prompt_analysis",
+        level: "warning",
+        title: "提示词分析使用本地预检",
+        message: analysisModel ? "未配置 API Key，未请求 AI 分析接口。" : "未检测到可用分析模型，未请求 AI 分析接口。",
+        endpoint: "/api/prompt/analyze",
+        params: {
+          ...apiLogSnapshot(),
+          mode,
+          prompt: truncateForLog(promptText),
+          referenceCount: usableAnalysisReferences.length,
+        },
+      });
       return {
         ...fallback,
         analysisModel: analysisModel || "本地预检",
@@ -3228,10 +3574,44 @@ export default function App() {
       };
     }
 
-    const response = await fetch("/api/prompt/analyze", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const startedAt = Date.now();
+    const requestParamsForLog = {
+      ...apiLogSnapshot(),
+      analysisModel,
+      prompt: truncateForLog(promptText),
+      negativePrompt: truncateForLog(analysisParams.negativePrompt || "", 400),
+      aspectRatio: analysisParams.aspectRatio,
+      size: analysisParams.size || resolveSize(analysisParams.aspectRatio, analysisParams.resolution),
+      resolution: analysisParams.resolution,
+      quality: analysisParams.quality,
+      outputFormat: analysisParams.outputFormat,
+      count: analysisParams.batchCount,
+      concurrency: analysisParams.concurrency,
+      referenceCount: usableAnalysisReferences.length,
+      referenceIssues: analysisReferences
+        .filter((image) => image.status && image.status !== "ready")
+        .map((image) => ({ name: image.name, status: image.status, message: image.message })),
+      protocol: apiConfig.protocol,
+      imageModel: selectedModel,
+      mode,
+      agentId: agentContext?.plan.agentId,
+      agentName: agentContext?.plan.agentName,
+      agentScenario: agentContext?.plan.scenario,
+      promptVariant: agentContext?.variant,
+    };
+    pushLocalLog({
+      type: "prompt_analysis",
+      level: "info",
+      title: "开始提示词分析",
+      message: `使用 ${analysisModel} 做 ${analysisModeLabel(mode)}。`,
+      endpoint: "/api/prompt/analyze",
+      params: requestParamsForLog,
+    });
+    try {
+      const response = await fetch("/api/prompt/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
         baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
         apiKey: apiConfig.apiKey,
         clientId: getClientId(),
@@ -3256,17 +3636,46 @@ export default function App() {
         agentName: agentContext?.plan.agentName,
         agentScenario: agentContext?.plan.scenario,
         promptVariant: agentContext?.variant,
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok || !payload.ok) {
-      throw payload.detail || payload;
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) {
+        throw payload.detail || payload;
+      }
+      const result = normalizePromptAnalysisResult(payload.analysis, {
+        ...fallback,
+        analysisModel,
+        source: "ai",
+      });
+      pushLocalLog({
+        type: "prompt_analysis",
+        level: "success",
+        title: "提示词分析完成",
+        message: result.summary,
+        endpoint: "/api/prompt/analyze",
+        durationMs: Date.now() - startedAt,
+        params: requestParamsForLog,
+        response: {
+          score: result.score,
+          riskLevel: result.riskLevel,
+          safe: result.safe,
+          source: result.source,
+        },
+      });
+      return result;
+    } catch (error) {
+      pushLocalLog({
+        type: "prompt_analysis",
+        level: "error",
+        title: "提示词分析失败",
+        message: formatError(error),
+        endpoint: "/api/prompt/analyze",
+        durationMs: Date.now() - startedAt,
+        params: requestParamsForLog,
+        error: safeLogError(error),
+      });
+      throw error;
     }
-    return normalizePromptAnalysisResult(payload.analysis, {
-      ...fallback,
-      analysisModel,
-      source: "ai",
-    });
   }
 
   function triggerSendLaunchAnimation() {
@@ -3744,12 +4153,19 @@ export default function App() {
     setAgentAutoApplySeconds(null);
   }
 
-  function openAgentPanel(agentId = selectedAgentId) {
-    const nextAgent = INDUSTRY_AGENTS.find((agent) => agent.id === agentId) || INDUSTRY_AGENTS[0];
+  function openAgentPanel(agentId?: string) {
+    const targetAgentId = agentId ?? selectedAgentId;
+    const nextAgent = targetAgentId ? INDUSTRY_AGENTS.find((agent) => agent.id === targetAgentId) || null : null;
     markAgentHintSeen();
     stopAgentAutoApply();
-    setSelectedAgentId(nextAgent.id);
-    setAgentValues(createAgentDefaults(nextAgent));
+    setIsAgentQuickbarExpanded(true);
+    if (nextAgent) {
+      setSelectedAgentId(nextAgent.id);
+      setAgentValues(createAgentDefaults(nextAgent));
+    } else {
+      setSelectedAgentId("");
+      setAgentValues({});
+    }
     setAgentPlan(null);
     setAgentPhase("collecting");
     setShowPromptPresets(false);
@@ -3759,6 +4175,7 @@ export default function App() {
 
   function selectAgent(agent: IndustryAgent) {
     stopAgentAutoApply();
+    setIsAgentQuickbarExpanded(true);
     setSelectedAgentId(agent.id);
     setAgentValues(createAgentDefaults(agent));
     setAgentPlan(null);
@@ -3849,19 +4266,23 @@ export default function App() {
   }
 
   function handleCanvasScroll() {
-    if (composerCollapseTimerRef.current) {
-      window.clearTimeout(composerCollapseTimerRef.current);
-    }
-    if (
-      prompt.trim() ||
-      isAgentPanelOpen ||
-      analysisState.status !== "idle" ||
-      analysisCountdown ||
-      referenceImages.length > 0
-    ) {
-      return;
-    }
-    composerCollapseTimerRef.current = window.setTimeout(() => setIsComposerCollapsed(true), 120);
+    if (scrollFrameRef.current) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = undefined;
+      if (composerCollapseTimerRef.current) {
+        window.clearTimeout(composerCollapseTimerRef.current);
+      }
+      if (
+        prompt.trim() ||
+        isAgentPanelOpen ||
+        analysisState.status !== "idle" ||
+        analysisCountdown ||
+        referenceImages.length > 0
+      ) {
+        return;
+      }
+      composerCollapseTimerRef.current = window.setTimeout(() => setIsComposerCollapsed(true), 120);
+    });
   }
 
   function previewCurrent(item: Job | HistoryRecord) {
@@ -4066,6 +4487,15 @@ export default function App() {
             <strong>{selectedModel || "未选择"}</strong>
           </div>
           <div className="topbar-cluster right">
+            <button
+              type="button"
+              className={`topbar-log-button ${latestLocalLogLevel ? `is-${latestLocalLogLevel}` : ""}`}
+              title="查看本地请求日志"
+              onClick={() => setIsLocalLogOpen((value) => !value)}
+            >
+              <Database size={15} />
+              <span>{localLogs.length}</span>
+            </button>
             <SidebarToggleButton
               side="right"
               open={isSettingsOpen}
@@ -4074,6 +4504,49 @@ export default function App() {
             />
           </div>
         </header>
+        {isLocalLogOpen && (
+          <section className="local-log-panel" role="dialog" aria-label="本地请求日志">
+            <div className="local-log-head">
+              <div>
+                <strong>本地请求日志</strong>
+                <span>只保存在当前浏览器，API Key 和参考图内容已脱敏。</span>
+              </div>
+              <div className="local-log-actions">
+                <button type="button" className="subtle-button compact" onClick={clearLocalLogs} disabled={localLogs.length === 0}>
+                  <Trash2 size={14} />
+                  清空
+                </button>
+                <button type="button" className="icon-button" title="关闭日志" onClick={() => setIsLocalLogOpen(false)}>
+                  <X size={15} />
+                </button>
+              </div>
+            </div>
+            <div className="local-log-list">
+              {localLogs.length === 0 ? (
+                <div className="local-log-empty">暂无日志。提交生成或读取模型后会显示请求详情。</div>
+              ) : (
+                localLogs.map((log, index) => (
+                  <details className={`local-log-item ${log.level}`} key={log.id} open={index === 0}>
+                    <summary>
+                      <span>{formatFullDate(log.createdAt)}</span>
+                      <strong>{log.title}</strong>
+                      <small>{log.endpoint || log.type}{log.durationMs !== undefined ? ` · ${formatDuration(log.durationMs)}` : ""}</small>
+                    </summary>
+                    <div className="local-log-body">
+                      <p>{log.message}</p>
+                      {log.requestId && <span className="local-log-request-id">requestID：{log.requestId}</span>}
+                      <pre>{JSON.stringify({
+                        params: log.params,
+                        response: log.response,
+                        error: log.error,
+                      }, null, 2)}</pre>
+                    </div>
+                  </details>
+                ))
+              )}
+            </div>
+          </section>
+        )}
 
         <section className="canvas" ref={canvasRef} onScroll={handleCanvasScroll}>
           {visibleRecords.length === 0 && !isLoadingMainRecords ? (
@@ -4183,38 +4656,54 @@ export default function App() {
           <div className="agent-quickbar">
             <button
               type="button"
-              className={`agent-entry-button ${!isAgentHintSeen ? "needs-attention" : ""}`}
-              title="打开行业 Agent，一键生成行业方案"
+              className={[
+                "agent-entry-button",
+                isAgentEnabled ? "is-enabled" : "is-muted",
+                !isAgentHintSeen ? "needs-attention" : "",
+              ].filter(Boolean).join(" ")}
+              title={isAgentEnabled ? "打开已选行业 Agent" : "打开行业 Agent 选择器"}
               onClick={() => openAgentPanel()}
             >
               <WandSparkles size={15} />
-              行业 Agent · 一键生成方案
+              {isAgentEnabled ? `${selectedAgent?.name || "行业 Agent"} · 已启用` : "行业 Agent · 未启用"}
               <ChevronRight size={14} />
-              <small>可点击</small>
+              <small>{isAgentEnabled ? "可修改" : "可开启"}</small>
+            </button>
+            <button
+              type="button"
+              className="agent-expand-button"
+              onClick={() => setIsAgentQuickbarExpanded((value) => !value)}
+              aria-expanded={isAgentQuickbarExpanded}
+              title={isAgentQuickbarExpanded ? "收起行业 Agent 快捷入口" : "展开行业 Agent 快捷入口"}
+            >
+              {isAgentQuickbarExpanded ? "收起" : "展开"}
+              <ChevronRight size={13} />
             </button>
             {isAgentHintVisible && (
               <div className="agent-entry-hint" role="status">
                 选择行业工作流，不填也能生成标准图
               </div>
             )}
-            <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
-              {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
-                <button
-                  type="button"
-                  key={agent.id}
-                  className={`agent-chip ${selectedAgentId === agent.id ? "active" : ""}`}
-                  title={agent.clickHint}
-                  onClick={() => openAgentPanel(agent.id)}
-                >
-                  <span>{agent.icon}</span>
-                  {agent.name}
-                  <small>{selectedAgentId === agent.id ? "已选" : "生成"}</small>
-                  <ChevronRight size={12} />
-                </button>
-              ))}
-            </div>
+            {isAgentQuickbarExpanded && (
+              <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
+                {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
+                  <button
+                    type="button"
+                    key={agent.id}
+                    className={`agent-chip ${selectedAgentId === agent.id ? "active" : ""}`}
+                    title={agent.clickHint}
+                    onClick={() => openAgentPanel(agent.id)}
+                  >
+                    <span>{agent.icon}</span>
+                    {agent.name}
+                    <small>{selectedAgentId === agent.id ? "已选" : "开启"}</small>
+                    <ChevronRight size={12} />
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
-          {isAgentPanelOpen && selectedAgent && (
+          {isAgentPanelOpen && (
             <div className="agent-modal">
               <button
                 type="button"
@@ -4263,6 +4752,8 @@ export default function App() {
                     ))}
                   </div>
                   <div className="agent-workspace">
+                    {selectedAgent ? (
+                      <>
                     <div className="agent-current">
                       <div>
                         <strong>{selectedAgent.name}</strong>
@@ -4352,10 +4843,23 @@ export default function App() {
                         <span />
                       </div>
                     )}
+                      </>
+                    ) : (
+                      <div className="agent-empty-select">
+                        <WandSparkles size={24} />
+                        <strong>先选择一个行业 Agent</strong>
+                        <span>默认不启用行业工作流。选择左侧行业后，系统会自动填入行业默认目标、比例、张数和负面提示词。</span>
+                      </div>
+                    )}
                   </div>
                 </div>
                 <div className="agent-panel-actions">
-                  {agentPlan ? (
+                  {!selectedAgent ? (
+                    <button type="button" className="primary-action compact" disabled>
+                      <WandSparkles size={15} />
+                      先选择行业 Agent
+                    </button>
+                  ) : agentPlan ? (
                     <>
                       {(Object.keys(agentPlan.promptVariants) as PromptVariant[]).map((variant) => (
                         <button
@@ -4433,7 +4937,7 @@ export default function App() {
               {referenceImages.map((image) => (
                 <div className={`reference-chip ${image.status || "ready"}`} key={image.id}>
                   {image.dataUrl ? (
-                    <img src={image.dataUrl} alt="" />
+                    <img src={image.thumbnailDataUrl || image.dataUrl} alt="" />
                   ) : (
                     <div className="reference-thumb-fallback">
                       <AlertCircle size={16} />
@@ -5377,6 +5881,8 @@ function AdminApp({
                     <td className="admin-model-cell" title={log.model}>{log.model || "-"}</td>
                     <td
                       title={[
+                        `API：${log.apiBaseUrl}`,
+                        `Key：${log.apiKeyPresent ? `${log.apiKeyPrefix || ""}...${log.apiKeySuffix || ""} · ${log.apiKeyLength || 0} 位` : "未读取到"}`,
                         log.upstreamPayloadKeys?.length ? `上游字段：${log.upstreamPayloadKeys.join(", ")}` : "",
                         log.upstreamReferenceMode ? `参考图模式：${log.upstreamReferenceMode}` : "",
                       ].filter(Boolean).join("\n")}
@@ -5865,7 +6371,7 @@ const JobCard = memo(function JobCard({
             <span>参考图 {storedReferenceImages.length}</span>
             <div>
               {storedReferenceImages.slice(0, 3).map((image) => (
-                <img key={image.id} src={image.dataUrl} alt="" loading="lazy" decoding="async" />
+                <img key={image.id} src={image.thumbnailDataUrl || image.dataUrl} alt="" loading="lazy" decoding="async" />
               ))}
             </div>
           </div>
@@ -6208,7 +6714,7 @@ function HistoryDetail({
         <div className="reference-readonly">
           {storedReferenceImages.map((image) => (
             <div key={image.id}>
-              <img src={image.dataUrl} alt="" />
+              <img src={image.thumbnailDataUrl || image.dataUrl} alt="" />
               <span>{image.name}</span>
               <small>{referenceDimensionLabel(image)} · {formatBytes(image.size)}</small>
             </div>
