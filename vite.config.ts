@@ -646,7 +646,7 @@ async function uploadCompatibleReferenceImage(baseUrl: string, apiKey: string, i
   return url;
 }
 
-async function compatibleReferenceImageUrls(baseUrl: string, apiKey: string, references: ReferenceImage[]) {
+function compatibleReferenceImageUrls(references: ReferenceImage[]) {
   if (references.length === 0) {
     return {
       urls: [] as string[],
@@ -655,22 +655,13 @@ async function compatibleReferenceImageUrls(baseUrl: string, apiKey: string, ref
     };
   }
 
-  try {
-    const urls = await Promise.all(
-      references.map((image, index) => uploadCompatibleReferenceImage(baseUrl, apiKey, image, index)),
-    );
-    return {
-      urls,
-      mode: "image_urls:uploaded_url",
-      uploaded: true,
-    };
-  } catch {
-    return {
-      urls: references.map(dataUrlToReferenceImageUrl),
-      mode: "image_urls:data_uri",
-      uploaded: false,
-    };
-  }
+  const dataUriPayload = {
+    urls: references.map(dataUrlToReferenceImageUrl),
+    mode: "image_urls:data_uri",
+    uploaded: false,
+  };
+
+  return dataUriPayload;
 }
 
 function shouldFallbackToGeneration(result: ImageResult) {
@@ -679,6 +670,13 @@ function shouldFallbackToGeneration(result: ImageResult) {
   if (![400, 404, 405, 415, 422, 501].includes(status)) return false;
   const detailText = JSON.stringify(result.detail || {}).toLowerCase();
   return /invalid url|not found|method not allowed|unsupported|unknown endpoint|no route|content-type/.test(detailText);
+}
+
+function shouldFallbackReferenceEditToGeneration(result: ImageResult) {
+  if (result.ok) return false;
+  const status = result.status || 0;
+  if (status === 401 || status === 403) return true;
+  return shouldFallbackToGeneration(result);
 }
 
 const SIZE_BY_RATIO: Record<string, string> = {
@@ -1117,11 +1115,20 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
   const protocol = request.protocol || DEFAULT_PROTOCOL;
   const references = Array.isArray(request.referenceImages) ? request.referenceImages : [];
   const outputFormat = request.outputFormat || "png";
-  if ((protocol === "openai-images" || protocol === "custom-openai") && references.length > 0) {
+  let editFallback: Record<string, unknown> | undefined;
+  if (protocol === "openai-images" && references.length > 0) {
     const editResult = await generateOpenAiImageEdit(baseUrl, apiKey, request, references, requestId);
-    if (editResult.ok || protocol === "openai-images" || !shouldFallbackToGeneration(editResult)) {
+    if (editResult.ok || !shouldFallbackReferenceEditToGeneration(editResult)) {
       return editResult;
     }
+    const summary = safeErrorSummary(editResult.detail);
+    editFallback = {
+      from: "/v1/images/edits",
+      status: editResult.status,
+      reason: summary.message,
+      type: summary.type,
+      code: summary.code,
+    };
   }
   const requestSize = imageSizeForProtocol(request, protocol);
   const payload: Record<string, unknown> = {
@@ -1140,11 +1147,13 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
   if (request.seed) payload.seed = Number.isFinite(Number(request.seed)) ? Number(request.seed) : request.seed;
   let referenceMode = "none";
   let referenceCount = 0;
-  if (references.length > 0 && protocol === "custom-openai") {
-    const referencePayload = await compatibleReferenceImageUrls(baseUrl, apiKey, references);
+  if (references.length > 0 && (protocol === "custom-openai" || protocol === "openai-images")) {
+    const referencePayload = compatibleReferenceImageUrls(references);
     if (referencePayload.urls.length > 0) {
       payload.image_urls = referencePayload.urls;
-      referenceMode = referencePayload.mode;
+      referenceMode = editFallback
+        ? `${referencePayload.mode}:fallback_from_edits_${editFallback.status || "error"}`
+        : referencePayload.mode;
       referenceCount = referencePayload.urls.length;
     }
   }
@@ -1157,7 +1166,7 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
       upstreamReferenceCount: referenceCount,
       upstreamReferenceMode: referenceMode,
       upstreamSize: typeof payload.size === "string" ? payload.size : undefined,
-      upstreamRequest: sanitizeForLog(payload),
+      upstreamRequest: sanitizeForLog(editFallback ? { ...payload, _proxyFallback: editFallback } : payload),
     });
   }
   const response = await fetchWithTimeout(endpoint(baseUrl, path), {
