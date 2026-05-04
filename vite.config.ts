@@ -393,6 +393,26 @@ function looksLikeLargeBase64(value: string) {
   return value.length > 180 && /^[A-Za-z0-9+/=\r\n]+$/.test(value);
 }
 
+function imageOmittedPlaceholder(value: string, fallbackMime?: string) {
+  const match = value.match(/^data:([^;]+);base64,(.*)$/);
+  const mime = match?.[1] || fallbackMime || "application/octet-stream";
+  const base64Body = match?.[2] ?? value;
+  const cleaned = base64Body.replace(/\s+/g, "");
+  const bytes = Math.round((cleaned.length * 3) / 4);
+  let sha256 = "";
+  try {
+    sha256 = createHash("sha256").update(cleaned).digest("hex").slice(0, 8);
+  } catch {
+    sha256 = "";
+  }
+  return {
+    __omitted: "image" as const,
+    mime,
+    bytes,
+    sha256,
+  };
+}
+
 function referenceImagesForLog(value: unknown) {
   if (!Array.isArray(value)) return value;
   return value.map((item, index) => {
@@ -404,7 +424,7 @@ function referenceImagesForLog(value: unknown) {
       type: typeof image.type === "string" ? image.type : undefined,
       hasImageContent: Boolean(dataUrl),
       imageContentBytes: dataUrl.length,
-      dataUrl: dataUrl ? "[image-data-redacted]" : undefined,
+      dataUrl: dataUrl ? imageOmittedPlaceholder(dataUrl, typeof image.type === "string" ? image.type : undefined) : undefined,
     };
   });
 }
@@ -427,7 +447,7 @@ function sanitizeForLog(value: unknown, key = "", depth = 0): unknown {
       || lowerKey === "b64_json"
       || (lowerKey === "data" && looksLikeLargeBase64(value))
     ) {
-      return `[image-data-redacted:${value.length} chars]`;
+      return imageOmittedPlaceholder(value);
     }
     return redactImageText(value);
   }
@@ -1685,6 +1705,36 @@ function imageProxyPlugin(): PluginOption {
               return;
             }
             sendJson(res, 200, { ok: true, log });
+            return;
+          }
+
+          if (path === "/logs/export" && req.method === "GET") {
+            const exportedAt = new Date().toISOString();
+            const filename = `image-studio-logs-${exportedAt.replace(/[:.]/g, "-")}.json`;
+            const payload = {
+              exportedAt,
+              exportedBy: user.username,
+              schemaVersion: 1,
+              admins: store.admins.map((admin) => ({
+                username: admin.username,
+                createdAt: admin.createdAt,
+                updatedAt: admin.updatedAt,
+                mustChangePassword: admin.mustChangePassword,
+              })),
+              auditLogs: store.auditLogs,
+              requestLogs: store.requestLogs,
+              counts: {
+                requestLogs: store.requestLogs.length,
+                auditLogs: store.auditLogs.length,
+                admins: store.admins.length,
+              },
+            };
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "application/json; charset=utf-8");
+            res.setHeader("Cache-Control", "no-store");
+            res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+            res.end(JSON.stringify(payload, null, 2));
+            appendAuditLog(user.username, "admin_export_logs", `count=${store.requestLogs.length}`);
             return;
           }
 

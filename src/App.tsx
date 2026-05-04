@@ -8,6 +8,7 @@ import {
   Copy,
   Database,
   Download,
+  DownloadCloud,
   ImagePlus,
   Loader2,
   LogOut,
@@ -73,6 +74,7 @@ type ImageParams = {
   outputFormat: "png" | "jpeg" | "webp";
   batchCount: number;
   concurrency: number;
+  retryLimit: number;
   seed: string;
   negativePrompt: string;
 };
@@ -122,6 +124,8 @@ type Job = {
   agentName?: string;
   agentScenario?: string;
   promptVariant?: PromptVariant;
+  attempt?: number;
+  maxAttempts?: number;
 };
 
 type StoredHistoryRecord = {
@@ -1413,6 +1417,7 @@ function normalizeImageParams(params: Partial<ImageParams> = {}): ImageParams {
     outputFormat: params.outputFormat === "jpeg" || params.outputFormat === "webp" ? params.outputFormat : "png",
     batchCount: clampNumber(Number(params.batchCount || 4), 1, 20),
     concurrency: clampNumber(Number(params.concurrency || 2), 1, 6),
+    retryLimit: Number.isFinite(Number(params.retryLimit)) ? clampNumber(Number(params.retryLimit), 0, 5) : 2,
     seed: typeof params.seed === "string" ? params.seed : "",
     negativePrompt: typeof params.negativePrompt === "string" ? params.negativePrompt : "",
   };
@@ -2017,6 +2022,19 @@ function truncateForLog(value: string, limit = LOG_TEXT_LIMIT) {
   return `${value.slice(0, limit)}...(${value.length} chars)`;
 }
 
+function clientImageOmittedPlaceholder(value: string) {
+  const match = value.match(/^data:([^;]+);base64,(.*)$/);
+  const mime = match?.[1] || "application/octet-stream";
+  const base64Body = match?.[2] ?? value;
+  const cleaned = base64Body.replace(/\s+/g, "");
+  const bytes = Math.round((cleaned.length * 3) / 4);
+  return {
+    __omitted: "image" as const,
+    mime,
+    bytes,
+  };
+}
+
 function sanitizeClientLogValue(value: unknown, key = "", depth = 0): unknown {
   const lowerKey = key.toLowerCase();
   if (depth > 8) return "[depth-limit]";
@@ -2032,7 +2050,7 @@ function sanitizeClientLogValue(value: unknown, key = "", depth = 0): unknown {
       || lowerKey === "b64_json"
       || (lowerKey === "data" && value.length > 180 && /^[A-Za-z0-9+/=\r\n]+$/.test(value))
     ) {
-      return `[image-data-redacted:${value.length} chars]`;
+      return clientImageOmittedPlaceholder(value);
     }
     return truncateForLog(value, 4000);
   }
@@ -2062,6 +2080,33 @@ function safeLogError(error: unknown) {
   } catch {
     return String(error);
   }
+}
+
+function isRetryableError(errorDetail: unknown): boolean {
+  if (!errorDetail) return true;
+  if (typeof errorDetail !== "object") return false;
+  const record = errorDetail as Record<string, unknown>;
+  const status = typeof record.status === "number"
+    ? record.status
+    : typeof record.httpStatus === "number"
+      ? record.httpStatus
+      : null;
+  if (status !== null) {
+    if (status >= 500 && status < 600) return true;
+    if (status === 429) return true;
+    return false;
+  }
+  const errorField = record.error;
+  let messageRaw = "";
+  if (errorField && typeof errorField === "object") {
+    const inner = (errorField as Record<string, unknown>).message;
+    if (typeof inner === "string") messageRaw = inner;
+  } else if (typeof errorField === "string") {
+    messageRaw = errorField;
+  } else if (typeof record.errorMessage === "string") {
+    messageRaw = record.errorMessage;
+  }
+  return /timeout|network|connection|abort|fetch failed|econnreset|etimedout|enotfound/.test(messageRaw.toLowerCase());
 }
 
 async function readApiJson<T>(response: Response, endpoint: string): Promise<T> {
@@ -2533,6 +2578,8 @@ function createJob(
     agentName: agentContext?.plan.agentName,
     agentScenario: agentContext?.plan.scenario,
     promptVariant: agentContext?.variant,
+    attempt: 1,
+    maxAttempts: 1 + clampNumber(Number(params.retryLimit ?? 2), 0, 5),
   };
 }
 
@@ -3228,8 +3275,14 @@ export default function App() {
   }
 
   function pushLocalLog(entry: Omit<LocalLogEntry, "id" | "createdAt">) {
+    const sanitized: Omit<LocalLogEntry, "id" | "createdAt"> = {
+      ...entry,
+      params: entry.params ? sanitizeClientLogValue(entry.params) as Record<string, unknown> : entry.params,
+      response: entry.response ? sanitizeClientLogValue(entry.response) as Record<string, unknown> : entry.response,
+      error: entry.error !== undefined ? sanitizeClientLogValue(entry.error) : entry.error,
+    };
     setLocalLogs((current) => {
-      const next = [{ id: uid(), createdAt: Date.now(), ...entry }, ...current].slice(0, LOCAL_LOG_LIMIT);
+      const next = [{ id: uid(), createdAt: Date.now(), ...sanitized }, ...current].slice(0, LOCAL_LOG_LIMIT);
       saveLocalLogs(next);
       return next;
     });
@@ -3238,6 +3291,37 @@ export default function App() {
   function clearLocalLogs() {
     saveLocalLogs([]);
     setLocalLogs([]);
+  }
+
+  function exportLocalDiagnostics() {
+    const exportedAt = new Date().toISOString();
+    const filename = `image-studio-local-diagnostics-${exportedAt.replace(/[:.]/g, "-")}.json`;
+    const payload = {
+      exportedAt,
+      schemaVersion: 1,
+      apiConfig: {
+        protocol: apiConfig.protocol,
+        baseUrl: apiConfig.baseUrl,
+        apiKey: maskApiKeyForLog(apiConfig.apiKey, apiConfig.rememberKey),
+      },
+      params,
+      selectedModel,
+      selectedAnalysisModel,
+      modelState,
+      counts: {
+        localLogs: localLogs.length,
+        visibleRecords: visibleRecords.length,
+        sidebarRecords: sidebarRecords.length,
+      },
+      localLogs: localLogs.map((log) => sanitizeClientLogValue(log)),
+      currentFrontendVersion: CURRENT_FRONTEND_VERSION,
+      availableFrontendVersion,
+      userAgent: navigator.userAgent,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    downloadUrl(url, filename);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function imageRequestParamsForLog(job: Job, config: ApiConfig) {
@@ -3645,10 +3729,48 @@ export default function App() {
       const requestId = errorDetail && typeof errorDetail === "object" && "requestId" in errorDetail
         ? String((errorDetail as { requestId?: unknown }).requestId || "")
         : undefined;
+      const attempt = job.attempt ?? 1;
+      const maxAttempts = job.maxAttempts ?? 1;
+      const canRetry = attempt < maxAttempts && isRetryableError(errorDetail);
+      if (canRetry) {
+        const nextAttempt = attempt + 1;
+        const backoffMs = Math.min(8000, 500 * Math.pow(2, attempt - 1));
+        pushLocalLog({
+          type: "image_generation",
+          level: "warning",
+          title: `图片生成失败 #${job.index}/${job.total}，${Math.round(backoffMs / 1000)}s 后重试 (${nextAttempt}/${maxAttempts})`,
+          message: formatError(errorDetail),
+          endpoint: "/api/images/generate",
+          requestId,
+          durationMs,
+          params: requestParamsForLog,
+          response: {
+            ok: false,
+            requestId,
+            detail: sanitizeClientLogValue(errorDetail),
+            retry: { attempt, nextAttempt, maxAttempts, backoffMs },
+          },
+          error: safeLogError(errorDetail),
+        });
+        patchVisibleRecord(job.id, {
+          requestId,
+          status: "queued",
+          errorDetail,
+          startedAt: undefined,
+          finishedAt: undefined,
+          durationMs: undefined,
+          attempt: nextAttempt,
+          maxAttempts,
+        });
+        window.setTimeout(() => {
+          enqueueJobs([{ ...job, attempt: nextAttempt, status: "queued" }], config);
+        }, backoffMs);
+        return;
+      }
       pushLocalLog({
         type: "image_generation",
         level: "error",
-        title: `图片生成失败 #${job.index}/${job.total}`,
+        title: `图片生成失败 #${job.index}/${job.total}${attempt > 1 ? `（已重试 ${attempt - 1} 次）` : ""}`,
         message: formatError(errorDetail),
         endpoint: "/api/images/generate",
         requestId,
@@ -3658,6 +3780,7 @@ export default function App() {
           ok: false,
           requestId,
           detail: sanitizeClientLogValue(errorDetail),
+          retry: { attempt, maxAttempts, exhausted: true },
         },
         error: safeLogError(errorDetail),
       });
@@ -4273,6 +4396,9 @@ export default function App() {
         concurrency: patch.concurrency !== undefined
           ? clampNumber(Number(patch.concurrency), 1, 6)
           : current.concurrency,
+        retryLimit: patch.retryLimit !== undefined
+          ? clampNumber(Number(patch.retryLimit), 0, 5)
+          : current.retryLimit,
       };
     });
   }
@@ -4687,6 +4813,10 @@ export default function App() {
                 <span>只保存在当前浏览器，API Key 和参考图内容已脱敏。</span>
               </div>
               <div className="local-log-actions">
+                <button type="button" className="subtle-button compact" onClick={exportLocalDiagnostics} disabled={localLogs.length === 0} title="导出本地诊断为 JSON（图片内容已脱敏）">
+                  <DownloadCloud size={14} />
+                  导出
+                </button>
                 <button type="button" className="subtle-button compact" onClick={clearLocalLogs} disabled={localLogs.length === 0}>
                   <Trash2 size={14} />
                   清空
@@ -5659,6 +5789,16 @@ export default function App() {
               onChange={(event) => updateParams({ concurrency: Number(event.target.value) })}
             />
           </label>
+          <label title="生成失败时（5xx / 429 / 网络错误）自动重试的次数。范围 0–5，默认 2。">
+            <span>失败自动重试</span>
+            <input
+              type="number"
+              min={0}
+              max={5}
+              value={params.retryLimit}
+              onChange={(event) => updateParams({ retryLimit: Number(event.target.value) })}
+            />
+          </label>
           <label>
             <span>Seed</span>
             <input value={params.seed} onChange={(event) => updateParams({ seed: event.target.value })} />
@@ -5763,6 +5903,28 @@ function AdminApp({
       throw payload;
     }
     return payload as T;
+  }
+
+  async function exportAdminLogs() {
+    setAdminError("");
+    try {
+      const response = await fetch("/api/admin/logs/export", {
+        method: "GET",
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw detail || new Error(`HTTP ${response.status}`);
+      }
+      const blob = await response.blob();
+      const dispositionFilename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1];
+      const filename = dispositionFilename || `image-studio-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      const url = URL.createObjectURL(blob);
+      downloadUrl(url, filename);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setAdminError(formatError(error));
+    }
   }
 
   async function refreshMe() {
@@ -5982,6 +6144,10 @@ function AdminApp({
           <button type="button" className="subtle-button" onClick={() => void refreshDashboard()}>
             <RefreshCw size={16} />
             刷新
+          </button>
+          <button type="button" className="subtle-button" onClick={exportAdminLogs} title="下载完整请求日志为 JSON（图片内容已脱敏）">
+            <DownloadCloud size={16} />
+            导出日志
           </button>
           <button type="button" className="subtle-button" onClick={() => void handleLogout()}>
             <LogOut size={16} />
@@ -6633,14 +6799,14 @@ const JobCard = memo(function JobCard({
         {job.status === "queued" && (
           <div className="tile-state queued">
             <Clock3 size={22} />
-            <strong>排队中</strong>
+            <strong>{(job.attempt ?? 1) > 1 ? `重试中 ${job.attempt}/${job.maxAttempts}` : "排队中"}</strong>
           </div>
         )}
         {job.status === "error" && (
           <button type="button" className="tile-state tile-state-button error" onClick={onPreview} title="查看失败详情">
             <AlertCircle size={22} />
             <strong>生成失败</strong>
-            <span>查看详情</span>
+            <span>{(job.attempt ?? 1) > 1 ? `重试 ${(job.attempt ?? 1) - 1} 次后仍失败 · 查看详情` : "查看详情"}</span>
           </button>
         )}
         <div className="tile-index">#{job.index}</div>
