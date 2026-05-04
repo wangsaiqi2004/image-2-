@@ -30,7 +30,7 @@ type ReferenceImage = {
 };
 
 type ReferenceUrlPayload = {
-  field: "image_urls" | "reference_image_urls";
+  field: "image";
   urls: string[];
   mode: string;
   cleanup?: () => void;
@@ -740,40 +740,31 @@ function createTemporaryReferenceUrls(references: ReferenceImage[], publicBaseUr
 function compatibleReferenceImagePayloads(references: ReferenceImage[], publicBaseUrl = ""): ReferenceUrlPayload[] {
   if (references.length === 0) return [];
 
+  // 上游协议：POST /v1/images/generations + JSON body + image: array<string>
+  // 实测两种字符串都被识别：
+  //   1. data URI —— 客户端已压到 ≤ 512KB，base64 后 ~700KB，JSON 直接装得下
+  //   2. 公网 URL —— 上游回 fetch 我们的临时存储；只在 publicBaseUrl 真的公网可达时尝试
+  // 顺序：data URI 优先。本地 dev 时 publicBaseUrl 写死指向生产域名，
+  // 临时 URL 通道在本地内存里根本不存在，先发 data URI 能省掉一次必败的尝试。
+  // 历史上的 image_urls / reference_image_urls 字段名经实测**不被上游读取**，已删除。
   const dataUriUrls = references.map(dataUrlToReferenceImageUrl);
   const payloads: ReferenceUrlPayload[] = [];
 
-  if (isPublicReferenceBaseUrl(publicBaseUrl)) {
-    const temp = createTemporaryReferenceUrls(references, publicBaseUrl);
-    payloads.push({
-      field: "image_urls",
-      urls: temp.urls,
-      mode: "image_urls:temporary_url",
-      cleanup: temp.cleanup,
-    });
-  }
-
   payloads.push({
-    field: "image_urls",
+    field: "image",
     urls: dataUriUrls,
-    mode: "image_urls:data_uri",
+    mode: "image:data_uri",
   });
 
   if (isPublicReferenceBaseUrl(publicBaseUrl)) {
     const temp = createTemporaryReferenceUrls(references, publicBaseUrl);
     payloads.push({
-      field: "reference_image_urls",
+      field: "image",
       urls: temp.urls,
-      mode: "reference_image_urls:temporary_url",
+      mode: "image:temporary_url",
       cleanup: temp.cleanup,
     });
   }
-
-  payloads.push({
-    field: "reference_image_urls",
-    urls: dataUriUrls,
-    mode: "reference_image_urls:data_uri",
-  });
 
   return payloads;
 }

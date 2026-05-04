@@ -1582,6 +1582,7 @@ function historyRecordToJob(record: HistoryRecord): Job {
     model: record.model,
     params: normalizeImageParams(record.params),
     referenceImages: normalizeStoredReferenceImages(record.referenceImages),
+    submittedReferenceImages: record.submittedReferenceImages,
     status: record.status,
     createdAt: record.createdAt,
     startedAt: record.startedAt,
@@ -1593,6 +1594,10 @@ function historyRecordToJob(record: HistoryRecord): Job {
     height: record.height,
     revisedPrompt: record.revisedPrompt,
     errorDetail: record.errorDetail,
+    agentId: record.agentId,
+    agentName: record.agentName,
+    agentScenario: record.agentScenario,
+    promptVariant: record.promptVariant,
   };
 }
 
