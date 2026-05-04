@@ -1620,6 +1620,50 @@ textarea:focus-visible {
   grid-column: 2;
 }
 
+.ref-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 720;
+}
+
+.ref-pill-none {
+  border-color: #d7d7d1;
+  background: #f6f6f3;
+  color: var(--muted);
+}
+
+.ref-pill-prepared {
+  border-color: #c4d3e1;
+  background: #f0f6fc;
+  color: #3a6ea5;
+}
+
+.ref-pill-sent_ok {
+  border-color: #b8ded2;
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.ref-pill-sent_failed {
+  border-color: #efb4af;
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.ref-pill-skipped_unsupported {
+  border-color: #e6d0a4;
+  background: #fffaf0;
+  color: #b46b00;
+}
+
 .local-log-body {
   display: grid;
   gap: 8px;

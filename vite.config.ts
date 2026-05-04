@@ -114,6 +114,8 @@ type RequestLog = {
   agentScenario?: string;
   promptVariant?: string;
   referenceCount: number;
+  referenceTotalBytes?: number;
+  referenceUploadStatus?: "none" | "received" | "forwarded" | "succeeded" | "failed";
   upstreamPayloadKeys?: string[];
   upstreamReferenceCount?: number;
   upstreamReferenceMode?: string;
@@ -1294,6 +1296,7 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
           upstreamReferenceCount: referenceCount,
           upstreamReferenceMode: referenceMode,
           upstreamSize: typeof attemptPayload.size === "string" ? attemptPayload.size : undefined,
+          referenceUploadStatus: referenceCount > 0 ? "forwarded" : undefined,
           upstreamRequest: sanitizeForLog({
             ...attemptPayload,
             ...(editFallback ? { _proxyFallback: editFallback } : {}),
@@ -1889,6 +1892,18 @@ function imageProxyPlugin(): PluginOption {
             : {};
           const clientId = getString(body, "clientId") || "anonymous";
 
+          const incomingRefs = Array.isArray(request.referenceImages) ? request.referenceImages : [];
+          const referenceTotalBytes = incomingRefs.reduce((sum, image) => {
+            if (!image || typeof image !== "object") return sum;
+            const dataUrl = (image as { dataUrl?: unknown }).dataUrl;
+            if (typeof dataUrl !== "string") return sum;
+            const match = dataUrl.match(/^data:[^;]+;base64,(.*)$/);
+            const base64 = (match?.[1] ?? dataUrl).replace(/\s+/g, "");
+            return sum + Math.round((base64.length * 3) / 4);
+          }, 0);
+          const initialUploadStatus: NonNullable<RequestLog["referenceUploadStatus"]> =
+            incomingRefs.length === 0 ? "none" : "received";
+
           createRequestLog({
             requestId,
             requestType: "image_generation",
@@ -1904,7 +1919,7 @@ function imageProxyPlugin(): PluginOption {
             endpoint: generationEndpointLabel(
               protocol,
               request.model,
-              Array.isArray(request.referenceImages) ? request.referenceImages.length : 0,
+              incomingRefs.length,
             ),
             model: truncateText(request.model || "", 240),
             prompt: truncateText(request.prompt || "", 4000),
@@ -1919,7 +1934,9 @@ function imageProxyPlugin(): PluginOption {
             agentName: typeof requestMeta.agentName === "string" ? truncateText(requestMeta.agentName, 120) : undefined,
             agentScenario: typeof requestMeta.agentScenario === "string" ? truncateText(requestMeta.agentScenario, 240) : undefined,
             promptVariant: typeof requestMeta.promptVariant === "string" ? requestMeta.promptVariant : undefined,
-            referenceCount: Array.isArray(request.referenceImages) ? request.referenceImages.length : 0,
+            referenceCount: incomingRefs.length,
+            referenceTotalBytes,
+            referenceUploadStatus: initialUploadStatus,
             requestParams: sanitizeForLog({
               ...body,
               baseUrl,
@@ -1974,6 +1991,7 @@ function imageProxyPlugin(): PluginOption {
               status: "success",
               httpStatus: result.status || 200,
               responseBody: sanitizeForLog(result),
+              referenceUploadStatus: incomingRefs.length === 0 ? "none" : "succeeded",
               finishedAt,
               durationMs,
             });
@@ -1987,6 +2005,7 @@ function imageProxyPlugin(): PluginOption {
               errorCode: summary.code,
               errorRaw: summary.raw,
               responseBody: sanitizeForLog(result),
+              referenceUploadStatus: incomingRefs.length === 0 ? "none" : "failed",
               finishedAt,
               durationMs,
             });
@@ -2004,6 +2023,7 @@ function imageProxyPlugin(): PluginOption {
               errorType: "proxy_error",
               errorRaw: redactImageText(message, 2500),
               responseBody: sanitizeForLog({ ok: false, detail: { error: message } }),
+              referenceUploadStatus: "failed",
               finishedAt,
               durationMs: finishedAt - startedAt,
             });

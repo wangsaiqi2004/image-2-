@@ -168,6 +168,28 @@ type ModelLoadState = {
 type LocalLogLevel = "info" | "success" | "warning" | "error";
 type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation";
 
+type ReferenceUploadStatus =
+  | "none"
+  | "prepared"
+  | "sent_ok"
+  | "sent_failed"
+  | "skipped_unsupported";
+
+type ReferenceSummary = {
+  hasReferences: boolean;
+  count: number;
+  totalBytes: number;
+  status: ReferenceUploadStatus;
+  unsupportedReason?: string;
+  items?: Array<{
+    name: string;
+    type: string;
+    originalBytes: number;
+    requestBytes: number;
+    compressed: boolean;
+  }>;
+};
+
 type LocalLogEntry = {
   id: string;
   createdAt: number;
@@ -178,6 +200,7 @@ type LocalLogEntry = {
   endpoint?: string;
   requestId?: string;
   durationMs?: number;
+  referenceSummary?: ReferenceSummary;
   params?: Record<string, unknown>;
   response?: Record<string, unknown>;
   error?: unknown;
@@ -2022,6 +2045,18 @@ function truncateForLog(value: string, limit = LOG_TEXT_LIMIT) {
   return `${value.slice(0, limit)}...(${value.length} chars)`;
 }
 
+function describeReferenceForLog(summary: ReferenceSummary, model: string) {
+  if (summary.status === "none") return `模型 ${model}，无参考图。`;
+  if (summary.status === "skipped_unsupported") {
+    return `模型 ${model}，用户上传 ${summary.count} 张参考图，但${summary.unsupportedReason || "当前协议不支持参考图"}，已跳过。`;
+  }
+  const sizeLabel = summary.totalBytes > 0 ? `（压缩后 ${formatBytes(summary.totalBytes)}）` : "";
+  if (summary.status === "prepared") return `模型 ${model}，参考图 ${summary.count} 张${sizeLabel}已准备发送。`;
+  if (summary.status === "sent_ok") return `模型 ${model}，参考图 ${summary.count} 张${sizeLabel}已上传到上游。`;
+  if (summary.status === "sent_failed") return `模型 ${model}，参考图 ${summary.count} 张${sizeLabel}发送失败。`;
+  return `模型 ${model}，参考图 ${summary.count} 张${sizeLabel}。`;
+}
+
 function clientImageOmittedPlaceholder(value: string) {
   const match = value.match(/^data:([^;]+);base64,(.*)$/);
   const mime = match?.[1] || "application/octet-stream";
@@ -3296,9 +3331,48 @@ export default function App() {
   function exportLocalDiagnostics() {
     const exportedAt = new Date().toISOString();
     const filename = `image-studio-local-diagnostics-${exportedAt.replace(/[:.]/g, "-")}.json`;
+    const refStatusBuckets: Record<ReferenceUploadStatus, number> = {
+      none: 0,
+      prepared: 0,
+      sent_ok: 0,
+      sent_failed: 0,
+      skipped_unsupported: 0,
+    };
+    let imageGenLogCount = 0;
+    let totalRefBytes = 0;
+    for (const log of localLogs) {
+      if (log.type !== "image_generation") continue;
+      imageGenLogCount += 1;
+      if (log.referenceSummary) {
+        refStatusBuckets[log.referenceSummary.status] += 1;
+        totalRefBytes += log.referenceSummary.totalBytes;
+      }
+    }
+    const visibleSnapshot = visibleRecords.map((record) => ({
+      id: record.id,
+      requestId: record.requestId,
+      batchId: record.batchId,
+      index: record.index,
+      total: record.total,
+      protocol: record.protocol,
+      model: record.model,
+      promptPreview: record.prompt?.slice(0, 200) || "",
+      promptLength: record.prompt?.length || 0,
+      params: record.params,
+      referenceCount: record.referenceImages?.length ?? 0,
+      status: record.status,
+      attempt: record.attempt,
+      maxAttempts: record.maxAttempts,
+      startedAt: record.startedAt,
+      finishedAt: record.finishedAt,
+      durationMs: record.durationMs,
+      errorDetail: record.errorDetail ? sanitizeClientLogValue(record.errorDetail) : undefined,
+      agentName: record.agentName,
+      promptVariant: record.promptVariant,
+    }));
     const payload = {
       exportedAt,
-      schemaVersion: 1,
+      schemaVersion: 2,
       apiConfig: {
         protocol: apiConfig.protocol,
         baseUrl: apiConfig.baseUrl,
@@ -3308,15 +3382,22 @@ export default function App() {
       selectedModel,
       selectedAnalysisModel,
       modelState,
-      counts: {
+      queueStats,
+      summary: {
         localLogs: localLogs.length,
+        imageGenerationLogs: imageGenLogCount,
+        referenceUploadStatusDistribution: refStatusBuckets,
+        totalReferenceBytesSent: totalRefBytes,
         visibleRecords: visibleRecords.length,
         sidebarRecords: sidebarRecords.length,
+        retryLimit: params.retryLimit,
       },
+      visibleRecords: visibleSnapshot,
       localLogs: localLogs.map((log) => sanitizeClientLogValue(log)),
       currentFrontendVersion: CURRENT_FRONTEND_VERSION,
       availableFrontendVersion,
       userAgent: navigator.userAgent,
+      origin: window.location.origin,
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -3598,22 +3679,68 @@ export default function App() {
     let requestParamsForLog: Record<string, unknown> = imageRequestParamsForLog(job, config);
     patchVisibleRecord(job.id, { status: "running", startedAt, durationMs: 0 });
 
+    const protocolSupportsRefs = getProtocolDefinition(job.protocol).supportsReferenceImages;
+    const userRefsCount = job.referenceImages.length;
+    let preparedSummary: ReferenceSummary;
+    if (userRefsCount === 0) {
+      preparedSummary = { hasReferences: false, count: 0, totalBytes: 0, status: "none" };
+    } else if (!protocolSupportsRefs) {
+      preparedSummary = {
+        hasReferences: true,
+        count: userRefsCount,
+        totalBytes: 0,
+        status: "skipped_unsupported",
+        unsupportedReason: `当前协议 ${job.protocol} 不支持参考图`,
+      };
+    } else {
+      preparedSummary = {
+        hasReferences: true,
+        count: userRefsCount,
+        totalBytes: 0,
+        status: "prepared",
+      };
+    }
+
     try {
-      const requestReferenceImages = await referenceImagesForRequest(job.referenceImages);
+      let requestReferenceImages: Awaited<ReturnType<typeof referenceImagesForRequest>> = [];
+      if (protocolSupportsRefs && userRefsCount > 0) {
+        const prepared = await Promise.all(job.referenceImages.map(prepareReferenceForRequest));
+        requestReferenceImages = prepared.map((image) => ({
+          name: image.name,
+          type: image.type,
+          dataUrl: image.dataUrl,
+        }));
+        preparedSummary = {
+          hasReferences: true,
+          count: prepared.length,
+          totalBytes: prepared.reduce((sum, image) => sum + image.requestBytes, 0),
+          status: "prepared",
+          items: prepared.map((image) => ({
+            name: image.name,
+            type: image.type,
+            originalBytes: image.originalBytes,
+            requestBytes: image.requestBytes,
+            compressed: image.compressed,
+          })),
+        };
+      }
       requestParamsForLog = {
         ...requestParamsForLog,
         request: {
           ...(requestParamsForLog.request as Record<string, unknown>),
           preparedReferenceImages: preparedReferenceMetaForLog(requestReferenceImages),
-          preparedReferenceTotalBytes: requestReferenceImages.reduce((sum, image) => sum + dataUrlByteLength(image.dataUrl), 0),
+          preparedReferenceTotalBytes: preparedSummary.totalBytes,
+          referenceSummary: preparedSummary,
         },
       };
+      const startMessage = describeReferenceForLog(preparedSummary, job.model);
       pushLocalLog({
         type: "image_generation",
         level: "info",
-        title: `开始生成图片 #${job.index}/${job.total}`,
-        message: `模型 ${job.model}，参考图 ${job.referenceImages.length} 张。`,
+        title: `开始生成图片 #${job.index}/${job.total}${preparedSummary.hasReferences ? ` · 参考图 ${preparedSummary.count} 张` : " · 无参考图"}`,
+        message: startMessage,
         endpoint: "/api/images/generate",
+        referenceSummary: preparedSummary,
         params: requestParamsForLog,
       });
 
@@ -3660,14 +3787,18 @@ export default function App() {
       const finishedAt = Date.now();
       const durationMs = finishedAt - startedAt;
       const revisedPrompt = payload.images[0].revisedPrompt || "";
+      const successSummary: ReferenceSummary = preparedSummary.hasReferences && preparedSummary.status === "prepared"
+        ? { ...preparedSummary, status: "sent_ok" }
+        : preparedSummary;
       pushLocalLog({
         type: "image_generation",
         level: "success",
-        title: `图片生成成功 #${job.index}/${job.total}`,
-        message: `生成完成，尺寸 ${width} x ${height}。`,
+        title: `图片生成成功 #${job.index}/${job.total}${successSummary.hasReferences ? ` · 参考图 ${successSummary.count} 张已上传` : " · 无参考图"}`,
+        message: `生成完成，尺寸 ${width} x ${height}。${successSummary.hasReferences ? `参考图 ${successSummary.count} 张${successSummary.totalBytes > 0 ? `（${formatBytes(successSummary.totalBytes)}）` : ""}已发送给上游。` : ""}`,
         endpoint: "/api/images/generate",
         requestId: payload.requestId,
         durationMs,
+        referenceSummary: successSummary,
         params: requestParamsForLog,
         response: {
           width,
@@ -3735,14 +3866,18 @@ export default function App() {
       if (canRetry) {
         const nextAttempt = attempt + 1;
         const backoffMs = Math.min(8000, 500 * Math.pow(2, attempt - 1));
+        const retrySummary: ReferenceSummary = preparedSummary.hasReferences && preparedSummary.status === "prepared"
+          ? { ...preparedSummary, status: "sent_failed" }
+          : preparedSummary;
         pushLocalLog({
           type: "image_generation",
           level: "warning",
-          title: `图片生成失败 #${job.index}/${job.total}，${Math.round(backoffMs / 1000)}s 后重试 (${nextAttempt}/${maxAttempts})`,
+          title: `图片生成失败 #${job.index}/${job.total}，${Math.round(backoffMs / 1000)}s 后重试 (${nextAttempt}/${maxAttempts})${retrySummary.hasReferences ? ` · 参考图 ${retrySummary.count} 张` : ""}`,
           message: formatError(errorDetail),
           endpoint: "/api/images/generate",
           requestId,
           durationMs,
+          referenceSummary: retrySummary,
           params: requestParamsForLog,
           response: {
             ok: false,
@@ -3767,14 +3902,18 @@ export default function App() {
         }, backoffMs);
         return;
       }
+      const failedSummary: ReferenceSummary = preparedSummary.hasReferences && preparedSummary.status === "prepared"
+        ? { ...preparedSummary, status: "sent_failed" }
+        : preparedSummary;
       pushLocalLog({
         type: "image_generation",
         level: "error",
-        title: `图片生成失败 #${job.index}/${job.total}${attempt > 1 ? `（已重试 ${attempt - 1} 次）` : ""}`,
+        title: `图片生成失败 #${job.index}/${job.total}${attempt > 1 ? `（已重试 ${attempt - 1} 次）` : ""}${failedSummary.hasReferences ? ` · 参考图 ${failedSummary.count} 张` : " · 无参考图"}`,
         message: formatError(errorDetail),
         endpoint: "/api/images/generate",
         requestId,
         durationMs,
+        referenceSummary: failedSummary,
         params: requestParamsForLog,
         response: {
           ok: false,
@@ -4835,7 +4974,19 @@ export default function App() {
                     <summary>
                       <span>{formatFullDate(log.createdAt)}</span>
                       <strong>{log.title}</strong>
-                      <small>{log.endpoint || log.type}{log.durationMs !== undefined ? ` · ${formatDuration(log.durationMs)}` : ""}</small>
+                      <small>
+                        {log.endpoint || log.type}
+                        {log.durationMs !== undefined ? ` · ${formatDuration(log.durationMs)}` : ""}
+                        {log.referenceSummary && (
+                          <em className={`ref-pill ref-pill-${log.referenceSummary.status}`}>
+                            {log.referenceSummary.status === "none" && "无参考图"}
+                            {log.referenceSummary.status === "skipped_unsupported" && `${log.referenceSummary.count} 张未发送`}
+                            {log.referenceSummary.status === "prepared" && `${log.referenceSummary.count} 张待发送${log.referenceSummary.totalBytes > 0 ? ` · ${formatBytes(log.referenceSummary.totalBytes)}` : ""}`}
+                            {log.referenceSummary.status === "sent_ok" && `${log.referenceSummary.count} 张已上传${log.referenceSummary.totalBytes > 0 ? ` · ${formatBytes(log.referenceSummary.totalBytes)}` : ""}`}
+                            {log.referenceSummary.status === "sent_failed" && `${log.referenceSummary.count} 张发送失败`}
+                          </em>
+                        )}
+                      </small>
                     </summary>
                     <div className="local-log-body">
                       <p>{log.message}</p>
