@@ -396,7 +396,7 @@ const STORE_NAME = "history";
 const HISTORY_PAGE_SIZE = 20;
 const REFERENCE_LIMIT = 6;
 const MAX_REFERENCE_SIZE = 10 * 1024 * 1024;
-const MAX_REFERENCE_REQUEST_BYTES = 900 * 1024;
+const MAX_REFERENCE_REQUEST_BYTES = 512 * 1024;
 const REFERENCE_REQUEST_MAX_EDGE = 1536;
 const MIN_REFERENCE_EDGE = 128;
 const LARGE_REFERENCE_EDGE = 4096;
@@ -1095,7 +1095,7 @@ function buildAgentPlan(agent: IndustryAgent, values: Record<string, string>): A
     notes: [
       hasOverrides ? "已根据你的补充重新规划。" : agent.emptyStateHint,
       `已按「${agent.name}」补全行业摄影语言、比例、负面提示词和质量检查项。`,
-      "10 秒倒计时结束后会使用稳定版提示词生成，用户也可以手动切换版本。",
+      "选择 variant 后系统会把提示词填入输入框，你可以继续编辑再点生成。",
     ],
   };
 }
@@ -2595,7 +2595,7 @@ export default function App() {
   const [agentValues, setAgentValues] = useState<Record<string, string>>({});
   const [agentPlan, setAgentPlan] = useState<AgentPlan | null>(null);
   const [agentPhase, setAgentPhase] = useState<AgentRunPhase>("collecting");
-  const [agentAutoApplySeconds, setAgentAutoApplySeconds] = useState<number | null>(null);
+  const [lastAppliedAgent, setLastAppliedAgent] = useState<AgentContext | null>(null);
   const [localLogs, setLocalLogs] = useState<LocalLogEntry[]>(loadLocalLogs);
   const [isLocalLogOpen, setIsLocalLogOpen] = useState(false);
   const [analysisCountdown, setAnalysisCountdown] = useState<AnalysisCountdown | null>(null);
@@ -2739,19 +2739,6 @@ export default function App() {
     const timer = window.setTimeout(() => setIsAgentHintVisible(true), 1200);
     return () => window.clearTimeout(timer);
   }, [activePage, isAgentHintSeen, isAgentPanelOpen, isComposerCollapsed]);
-
-  useEffect(() => {
-    if (!isAgentPanelOpen || !agentPlan || agentAutoApplySeconds === null || agentPhase !== "prompting") return;
-    if (agentAutoApplySeconds <= 0) {
-      setAgentAutoApplySeconds(null);
-      void applyAgentVariant("stable");
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      setAgentAutoApplySeconds((current) => (current === null ? null : Math.max(0, current - 1)));
-    }, 1000);
-    return () => window.clearTimeout(timer);
-  }, [agentAutoApplySeconds, agentPhase, agentPlan, isAgentPanelOpen]);
 
   useEffect(() => {
     paramsRef.current = params;
@@ -3955,6 +3942,20 @@ export default function App() {
     setAnalysisCountdown(null);
   }
 
+  function abandonAnalysisCountdown() {
+    if (analysisCountdown) {
+      setPrompt((current) => current.trim() ? current : analysisCountdown.prompt);
+      if (analysisCountdown.referenceImages.length > 0) {
+        setReferenceImages((current) => current.length > 0 ? current : analysisCountdown.referenceImages);
+      }
+      if (analysisCountdown.agentContext && !lastAppliedAgent) {
+        setLastAppliedAgent(analysisCountdown.agentContext);
+      }
+    }
+    cancelAnalysisCountdown();
+    setAnalysisState({ status: "idle", mode: "send", message: "" });
+  }
+
   function startAnalysisCountdown({
     prompt: countdownPrompt,
     params: countdownParams,
@@ -4150,9 +4151,6 @@ export default function App() {
     if (options.clearReferenceImages !== false) {
       setReferenceImages([]);
     }
-    window.setTimeout(() => {
-      setPrompt((current) => (current.trim() === submittedPrompt ? "" : current));
-    }, 760);
   }
 
   async function requestStartBatch() {
@@ -4166,15 +4164,27 @@ export default function App() {
     const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
       ? usableReferenceImages
       : [];
+    const agentContext = lastAppliedAgent ?? undefined;
     triggerSendLaunchAnimation();
+    if (agentContext) setAgentPhase("generating");
+    setPrompt("");
+    setReferenceImages([]);
+    setLastAppliedAgent(null);
     if (!isAutoPromptAnalysisEnabled) {
       cancelAnalysisCountdown();
       setAnalysisState({ status: "idle", mode: "send", message: "" });
-      void startBatch(undefined, { promptOverride: submittedPrompt, referenceImagesOverride: snapshotReferenceImages });
+      void startBatch(undefined, {
+        promptOverride: submittedPrompt,
+        referenceImagesOverride: snapshotReferenceImages,
+        clearReferenceImages: false,
+        agentContext,
+      });
       return;
     }
-    setReferenceImages([]);
-    void analyzeBeforeGenerate(submittedPrompt, { referenceImagesOverride: snapshotReferenceImages });
+    void analyzeBeforeGenerate(submittedPrompt, {
+      referenceImagesOverride: snapshotReferenceImages,
+      agentContext,
+    });
   }
 
   async function retryJob(job: Job) {
@@ -4333,15 +4343,19 @@ export default function App() {
     setIsAgentHintVisible(false);
   }
 
-  function stopAgentAutoApply() {
-    setAgentAutoApplySeconds(null);
+  function disableAgent() {
+    setSelectedAgentId("");
+    setAgentValues({});
+    setAgentPlan(null);
+    setAgentPhase("collecting");
+    setIsAgentPanelOpen(false);
+    setLastAppliedAgent(null);
   }
 
   function openAgentPanel(agentId?: string) {
     const targetAgentId = agentId ?? selectedAgentId;
     const nextAgent = targetAgentId ? INDUSTRY_AGENTS.find((agent) => agent.id === targetAgentId) || null : null;
     markAgentHintSeen();
-    stopAgentAutoApply();
     setIsAgentQuickbarExpanded(true);
     if (nextAgent) {
       setSelectedAgentId(nextAgent.id);
@@ -4358,8 +4372,10 @@ export default function App() {
   }
 
   function selectAgent(agent: IndustryAgent) {
-    stopAgentAutoApply();
     setIsAgentQuickbarExpanded(true);
+    if (selectedAgentId !== agent.id) {
+      setLastAppliedAgent(null);
+    }
     setSelectedAgentId(agent.id);
     setAgentValues(createAgentDefaults(agent));
     setAgentPlan(null);
@@ -4367,7 +4383,6 @@ export default function App() {
   }
 
   function updateAgentValue(fieldId: string, value: string) {
-    stopAgentAutoApply();
     setAgentValues((current) => ({ ...current, [fieldId]: value }));
     setAgentPlan(null);
     setAgentPhase("collecting");
@@ -4380,7 +4395,6 @@ export default function App() {
       const nextPlan = buildAgentPlan(selectedAgent, agentValues);
       setAgentPlan(nextPlan);
       setAgentPhase("prompting");
-      setAgentAutoApplySeconds(10);
     }, 420);
   }
 
@@ -4409,43 +4423,21 @@ export default function App() {
     } as ImageParams;
   }
 
-  async function applyAgentVariant(variant: PromptVariant) {
-    stopAgentAutoApply();
+  function applyAgentVariant(variant: PromptVariant) {
     const plan = agentPlan || (selectedAgent ? buildAgentPlan(selectedAgent, agentValues) : null);
     if (!plan) return;
-    const apiKeyReady = await verifyApiKeyBeforeGeneration();
-    if (!apiKeyReady) return;
     const nextPrompt = plan.promptVariants[variant];
     const nextParams = paramsFromAgentPlan(plan);
-    const context = { plan, variant };
-    const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
-      ? usableReferenceImages
-      : [];
     setAgentPlan(plan);
     setParams(nextParams);
     setPrompt(nextPrompt);
-    setReferenceImages([]);
     setIsAgentPanelOpen(false);
     setIsComposerCollapsed(false);
-    setAgentPhase("prechecking");
-    window.requestAnimationFrame(resizePromptTextarea);
-    if (!selectedModel || !models.includes(selectedModel) || modelState.status !== "ready") return;
-    triggerSendLaunchAnimation();
-    if (isAutoPromptAnalysisEnabled) {
-      void analyzeBeforeGenerate(nextPrompt, {
-        paramsOverride: nextParams,
-        referenceImagesOverride: snapshotReferenceImages,
-        agentContext: context,
-      });
-      return;
-    }
-    setAgentPhase("generating");
-    void startBatch(undefined, {
-      promptOverride: nextPrompt,
-      paramsOverride: nextParams,
-      referenceImagesOverride: snapshotReferenceImages,
-      clearReferenceImages: false,
-      agentContext: context,
+    setAgentPhase("collecting");
+    setLastAppliedAgent({ plan, variant });
+    window.requestAnimationFrame(() => {
+      resizePromptTextarea();
+      promptTextareaRef.current?.focus();
     });
   }
 
@@ -4596,10 +4588,10 @@ export default function App() {
           type="button"
           onClick={() => {
             cancelAnalysisCountdown();
-            stopAgentAutoApply();
             setPrompt("");
             setReferenceImages([]);
             setIsAgentPanelOpen(false);
+            setLastAppliedAgent(null);
             setHighlightedRecordId("");
             canvasRef.current?.scrollTo({ top: 0, behavior: "smooth" });
           }}
@@ -4852,6 +4844,35 @@ export default function App() {
               <ChevronRight size={14} />
               <small>{isAgentEnabled ? "可修改" : "可开启"}</small>
             </button>
+            {isAgentEnabled && (
+              <button
+                type="button"
+                className="agent-disable-button"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  disableAgent();
+                }}
+                title="停用行业 Agent"
+                aria-label="停用行业 Agent"
+              >
+                <X size={13} />
+              </button>
+            )}
+            {lastAppliedAgent && (
+              <div className="agent-applied-chip" role="status">
+                <WandSparkles size={12} />
+                <span>{lastAppliedAgent.plan.agentName} · {PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]}</span>
+                <button
+                  type="button"
+                  className="agent-applied-chip-clear"
+                  onClick={() => setLastAppliedAgent(null)}
+                  title="清除 Agent 标签（保留提示词）"
+                  aria-label="清除 Agent 标签"
+                >
+                  <X size={11} />
+                </button>
+              </div>
+            )}
             <button
               type="button"
               className="agent-expand-button"
@@ -4892,10 +4913,7 @@ export default function App() {
                 type="button"
                 className="agent-modal-backdrop"
                 aria-label="关闭行业 Agent 背景"
-                onClick={() => {
-                  stopAgentAutoApply();
-                  setIsAgentPanelOpen(false);
-                }}
+                onClick={() => setIsAgentPanelOpen(false)}
               />
               <section className="agent-panel" role="dialog" aria-modal="true" aria-label="行业 Agent">
                 <div className="agent-panel-head">
@@ -4909,10 +4927,7 @@ export default function App() {
                     className="icon-button"
                     title="关闭行业 Agent"
                     aria-label="关闭行业 Agent"
-                    onClick={() => {
-                      stopAgentAutoApply();
-                      setIsAgentPanelOpen(false);
-                    }}
+                    onClick={() => setIsAgentPanelOpen(false)}
                   >
                     <X size={16} />
                   </button>
@@ -4955,31 +4970,17 @@ export default function App() {
                           <strong>生图 Brief</strong>
                           <p>{agentPlan.brief}</p>
                         </div>
-                        {agentAutoApplySeconds !== null && agentPhase === "prompting" && (
-                          <div className="agent-auto-countdown">
-                            <div>
-                              <strong>{agentAutoApplySeconds}s</strong>
-                              <span>后自动使用稳定版生成。点击创意版或商业版会立即停止倒计时。</span>
-                            </div>
-                            <button type="button" className="subtle-button" onClick={stopAgentAutoApply}>
-                              暂停
-                            </button>
-                            <div className="analysis-countdown-track">
-                              <span style={{ width: `${agentAutoApplySeconds * 10}%` }} />
-                            </div>
-                          </div>
-                        )}
                         <div className="agent-variant-grid">
                           {(Object.keys(agentPlan.promptVariants) as PromptVariant[]).map((variant) => (
                             <button
                               type="button"
                               className={`agent-variant-card ${variant === "stable" ? "recommended" : ""}`}
                               key={variant}
-                              onClick={() => void applyAgentVariant(variant)}
+                              onClick={() => applyAgentVariant(variant)}
                             >
                               <strong>{PROMPT_VARIANT_LABELS[variant]}</strong>
                               <span>{agentPlan.promptVariants[variant]}</span>
-                              <small>点击使用这一版生成</small>
+                              <small>应用到提示词，可继续编辑</small>
                             </button>
                           ))}
                         </div>
@@ -5049,10 +5050,10 @@ export default function App() {
                           type="button"
                           className={variant === "stable" ? "primary-action compact" : "subtle-button"}
                           key={variant}
-                          onClick={() => void applyAgentVariant(variant)}
+                          onClick={() => applyAgentVariant(variant)}
                         >
                           <WandSparkles size={15} />
-                          使用{PROMPT_VARIANT_LABELS[variant]}
+                          应用{PROMPT_VARIANT_LABELS[variant]}到提示词
                         </button>
                       ))}
                       <button type="button" className="subtle-button" onClick={generateAgentPlan} disabled={agentPhase === "planning"}>
@@ -5066,13 +5067,15 @@ export default function App() {
                       生成行业方案
                     </button>
                   )}
+                  {selectedAgent && (
+                    <button type="button" className="subtle-button danger" onClick={disableAgent}>
+                      停用行业 Agent
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="subtle-button"
-                    onClick={() => {
-                      stopAgentAutoApply();
-                      setIsAgentPanelOpen(false);
-                    }}
+                    onClick={() => setIsAgentPanelOpen(false)}
                   >
                     取消
                   </button>
@@ -5180,7 +5183,7 @@ export default function App() {
                   <div className="analysis-countdown-track" aria-hidden="true">
                     <span style={{ width: `${(analysisCountdown.secondsLeft / 10) * 100}%` }} />
                   </div>
-                  <button type="button" className="subtle-button" onClick={cancelAnalysisCountdown}>
+                  <button type="button" className="subtle-button" onClick={abandonAnalysisCountdown}>
                     停止自动生成
                   </button>
                 </div>

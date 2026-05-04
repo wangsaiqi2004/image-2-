@@ -2774,6 +2774,96 @@ textarea:focus-visible {
   color: var(--muted);
 }
 
+.agent-disable-button {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid #e2c8c5;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--red);
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    background 150ms ease,
+    transform 150ms ease;
+}
+
+.agent-disable-button:hover {
+  border-color: var(--red);
+  background: var(--red-soft);
+  box-shadow: 0 6px 14px rgba(217, 45, 32, 0.12);
+  transform: translateY(-1px);
+}
+
+.agent-disable-button:active {
+  transform: scale(0.94);
+}
+
+.agent-disable-button:focus-visible {
+  outline: 2px solid var(--red);
+  outline-offset: 2px;
+}
+
+.agent-applied-chip {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 4px 0 9px;
+  border: 1px solid #c4d8d2;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #f7fffc 0%, #eef7f3 100%);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 780;
+  line-height: 1;
+}
+
+.agent-applied-chip svg {
+  flex: 0 0 auto;
+}
+
+.agent-applied-chip span {
+  white-space: nowrap;
+}
+
+.agent-applied-chip-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+.agent-applied-chip-clear:hover {
+  background: rgba(217, 45, 32, 0.08);
+  color: var(--red);
+}
+
+.subtle-button.danger {
+  border-color: #e2c8c5;
+  color: var(--red);
+}
+
+.subtle-button.danger:hover {
+  border-color: var(--red);
+  background: var(--red-soft);
+}
+
 .agent-entry-hint {
   position: absolute;
   z-index: 4;

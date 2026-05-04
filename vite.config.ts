@@ -1994,9 +1994,9 @@ export default defineConfig({
   build: {
     rollupOptions: {
       output: {
-        entryFileNames: `assets/[name]-[hash]-v${FRONTEND_BUILD_VERSION}.js`,
-        chunkFileNames: `assets/[name]-[hash]-v${FRONTEND_BUILD_VERSION}.js`,
-        assetFileNames: `assets/[name]-[hash]-v${FRONTEND_BUILD_VERSION}[extname]`,
+        entryFileNames: `assets/v${FRONTEND_BUILD_VERSION}-[name]-[hash].js`,
+        chunkFileNames: `assets/v${FRONTEND_BUILD_VERSION}-[name]-[hash].js`,
+        assetFileNames: `assets/v${FRONTEND_BUILD_VERSION}-[name]-[hash][extname]`,
       },
     },
   },
