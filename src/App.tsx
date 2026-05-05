@@ -4810,35 +4810,27 @@ export default function App() {
 
   function generateAgentPlan() {
     if (!selectedAgent) return;
-    setAgentPhase("planning");
-    window.setTimeout(() => {
-      const nextPlan = buildAgentPlan(selectedAgent, agentValues);
-      setAgentPlan(nextPlan);
-      setAgentPhase("prompting");
-    }, 420);
+    // buildAgentPlan 是纯本地拼接，无需"假装 AI 在思考"的延迟
+    const nextPlan = buildAgentPlan(selectedAgent, agentValues);
+    setAgentPlan(nextPlan);
+    setAgentPhase("prompting");
   }
 
   function paramsFromAgentPlan(plan: AgentPlan) {
+    // Agent 是给视觉/创意方向建议，不是控制运行行为。
+    // 覆盖创意方向：aspectRatio + 派生 size + negativePrompt
+    // 保留运行参数：batchCount / concurrency / quality / outputFormat / resolution / seed / retryLimit
+    // —— 用户调好的批量数 / 清晰度等应当跨 Agent 应用保留
     const recommendedRatio = typeof plan.recommendedParams.aspectRatio === "string"
       ? plan.recommendedParams.aspectRatio
       : params.aspectRatio;
     const nextRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio)
       ? recommendedRatio
       : params.aspectRatio;
-    const nextResolution = safeImageResolution(plan.recommendedParams.resolution || params.resolution);
     return {
       ...params,
-      ...plan.recommendedParams,
       aspectRatio: nextRatio,
-      resolution: nextResolution,
-      size: resolveSize(nextRatio, nextResolution),
-      batchCount: clampNumber(Number(plan.recommendedParams.batchCount || params.batchCount), 1, 20),
-      concurrency: params.concurrency,
-      outputFormat: params.outputFormat,
-      seed: params.seed,
-      quality: protocolDefinition.supportsQuality
-        ? String(plan.recommendedParams.quality || params.quality)
-        : params.quality,
+      size: resolveSize(nextRatio, safeImageResolution(params.resolution)),
       negativePrompt: plan.negativePrompt || params.negativePrompt,
     } as ImageParams;
   }

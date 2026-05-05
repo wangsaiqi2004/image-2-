@@ -774,7 +774,8 @@ function shouldTryNextReferencePayload(result: ImageResult) {
   const status = result.status || 0;
   if ([400, 401, 403, 404, 405, 413, 415, 422, 429, 500, 502, 503].includes(status)) return true;
   const detailText = JSON.stringify(result.detail || {}).toLowerCase();
-  return /image_urls|reference_image_urls|reference|image|url|data uri|base64|payload|too large|unsupported|unknown|invalid/.test(detailText);
+  // 历史 image_urls / reference_image_urls 字段 2026-05-04 已删，正则不再匹配它们
+  return /reference|image|url|data uri|base64|payload|too large|unsupported|unknown|invalid/.test(detailText);
 }
 
 function shouldFallbackToGeneration(result: ImageResult) {
