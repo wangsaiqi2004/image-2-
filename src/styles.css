@@ -2757,6 +2757,18 @@ textarea:focus-visible {
   color: var(--green);
 }
 
+.agent-entry-button.is-active {
+  border-color: var(--green);
+  background: var(--green);
+  color: #fff;
+  box-shadow: 0 8px 18px rgba(16, 163, 127, 0.22);
+}
+
+.agent-entry-button.is-active:hover {
+  background: #0f8d6c;
+  border-color: #0f8d6c;
+}
+
 .agent-entry-button.is-muted {
   border-color: #d7d7d1;
   background: rgba(246, 246, 243, 0.9);
@@ -2816,6 +2828,12 @@ textarea:focus-visible {
 .agent-entry-button.is-muted small {
   border-color: #d7d7d1;
   color: var(--muted);
+}
+
+.agent-entry-button.is-active small {
+  border-color: #fff;
+  background: var(--green);
+  color: #fff;
 }
 
 .agent-disable-button {

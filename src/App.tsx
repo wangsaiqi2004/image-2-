@@ -4772,14 +4772,20 @@ export default function App() {
     markAgentHintSeen();
     setIsAgentQuickbarExpanded(true);
     if (nextAgent) {
-      setSelectedAgentId(nextAgent.id);
-      setAgentValues(createAgentDefaults(nextAgent));
+      // 同一个 Agent 重开：保留 agentValues / agentPlan / agentPhase，避免用户填好的字段被冲掉
+      // 切换到不同 Agent：才重置
+      if (selectedAgentId !== nextAgent.id) {
+        setSelectedAgentId(nextAgent.id);
+        setAgentValues(createAgentDefaults(nextAgent));
+        setAgentPlan(null);
+        setAgentPhase("collecting");
+      }
     } else {
       setSelectedAgentId("");
       setAgentValues({});
+      setAgentPlan(null);
+      setAgentPhase("collecting");
     }
-    setAgentPlan(null);
-    setAgentPhase("collecting");
     setShowPromptPresets(false);
     setIsComposerCollapsed(false);
     setIsAgentPanelOpen(true);
@@ -4840,6 +4846,10 @@ export default function App() {
   function applyAgentVariant(variant: PromptVariant) {
     const plan = agentPlan || (selectedAgent ? buildAgentPlan(selectedAgent, agentValues) : null);
     if (!plan) return;
+    // 应用新 variant 等于覆盖当前 prompt —— 任何待执行的旧倒计时（snapshot 着旧 prompt）必须取消，
+    // 否则会用旧 prompt 跑生成而 UI 显示新 prompt，行为割裂。
+    cancelAnalysisCountdown();
+    setAnalysisState({ status: "idle", mode: "send", message: "" });
     const nextPrompt = plan.promptVariants[variant];
     const nextParams = paramsFromAgentPlan(plan);
     setAgentPlan(plan);
@@ -5264,16 +5274,28 @@ export default function App() {
               type="button"
               className={[
                 "agent-entry-button",
-                isAgentEnabled ? "is-enabled" : "is-muted",
+                lastAppliedAgent ? "is-active" : isAgentEnabled ? "is-enabled" : "is-muted",
                 !isAgentHintSeen ? "needs-attention" : "",
               ].filter(Boolean).join(" ")}
-              title={isAgentEnabled ? "打开已选行业 Agent" : "打开行业 Agent 选择器"}
+              title={
+                lastAppliedAgent
+                  ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用到当前提示词`
+                  : isAgentEnabled
+                    ? "已选行业，点开面板应用 variant"
+                    : "打开行业 Agent 选择器"
+              }
               onClick={() => openAgentPanel()}
             >
               <WandSparkles size={15} />
-              {isAgentEnabled ? `${selectedAgent?.name || "行业 Agent"} · 已启用` : "行业 Agent · 未启用"}
+              {lastAppliedAgent
+                ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用`
+                : isAgentEnabled
+                  ? `${selectedAgent?.name || "行业 Agent"} · 已选`
+                  : "行业 Agent · 未启用"}
               <ChevronRight size={14} />
-              <small>{isAgentEnabled ? "可修改" : "可开启"}</small>
+              <small>
+                {lastAppliedAgent ? "送出后清" : isAgentEnabled ? "可应用" : "可开启"}
+              </small>
             </button>
             {isAgentEnabled && (
               <button
