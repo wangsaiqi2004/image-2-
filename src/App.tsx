@@ -267,7 +267,7 @@ type PromptAnalysisResult = {
 };
 
 type PromptAnalysisState = {
-  status: "idle" | "analyzing" | "ready" | "error";
+  status: "idle" | "analyzing" | "receiving" | "ready" | "error";
   mode: AnalysisMode;
   message: string;
   result?: PromptAnalysisResult;
@@ -2787,7 +2787,7 @@ export default function App() {
       : `参考图不会发送 · 当前协议不支持`
     : `${protocolDefinition.shortLabel} · ${resolvedRequestSize}`;
   const failedVisibleRecordCount = visibleStats.error;
-  const isPromptAnalyzing = analysisState.status === "analyzing";
+  const isPromptAnalyzing = analysisState.status === "analyzing" || analysisState.status === "receiving";
   const selectedAgent = useMemo(
     () => INDUSTRY_AGENTS.find((agent) => agent.id === selectedAgentId) || null,
     [selectedAgentId],
@@ -4072,7 +4072,7 @@ export default function App() {
     try {
       const response = await fetch("/api/prompt/analyze", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
         body: JSON.stringify({
         baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
         apiKey: apiConfig.apiKey,
@@ -4100,28 +4100,143 @@ export default function App() {
         promptVariant: agentContext?.variant,
         }),
       });
-      const payload = await readApiJson<{ ok?: boolean; requestId?: string; analysis?: unknown; detail?: unknown }>(response, "/api/prompt/analyze");
-      if (!response.ok || !payload.ok) {
-        throw payload.detail || payload;
+
+      // 后端可能仍然走非流式（旧版兜底）
+      const contentType = response.headers.get("content-type") || "";
+      if (!contentType.includes("text/event-stream")) {
+        const payload = await readApiJson<{ ok?: boolean; requestId?: string; analysis?: unknown; detail?: unknown }>(response, "/api/prompt/analyze");
+        if (!response.ok || !payload.ok) {
+          throw payload.detail || payload;
+        }
+        const result = normalizePromptAnalysisResult(payload.analysis, {
+          ...fallback,
+          analysisModel,
+          source: "ai",
+        });
+        pushLocalLog({
+          type: "prompt_analysis",
+          level: "success",
+          title: "提示词分析完成（非流式）",
+          message: result.summary,
+          endpoint: "/api/prompt/analyze",
+          requestId: payload.requestId,
+          durationMs: Date.now() - startedAt,
+          params: requestParamsForLog,
+          response: {
+            score: result.score,
+            riskLevel: result.riskLevel,
+            safe: result.safe,
+            source: result.source,
+            analysis: sanitizeClientLogValue(result),
+          },
+        });
+        return result;
       }
-      const result = normalizePromptAnalysisResult(payload.analysis, {
+
+      if (!response.body) throw new Error("分析响应体为空");
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw { error: `HTTP ${response.status}`, raw: truncateForLog(errorText, 1600) };
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let analysis: unknown = null;
+      let upstreamRequestId: string | undefined;
+      let chunkCount = 0;
+      let firstByteAt: number | undefined;
+      let receivingAt: number | undefined;
+      let lastError: unknown = null;
+      let totalLength = 0;
+
+      const flushFrame = (event: string, data: unknown) => {
+        switch (event) {
+          case "started":
+            upstreamRequestId = (data as { requestId?: string })?.requestId;
+            setAnalysisState((current) => ({ ...current, status: "analyzing", message: "已发送，等待模型响应..." }));
+            break;
+          case "upstream_connected":
+            firstByteAt = Date.now();
+            setAnalysisState((current) => ({ ...current, status: "analyzing", message: "上游已连接，等待模型生成..." }));
+            break;
+          case "receiving":
+            receivingAt = Date.now();
+            setAnalysisState((current) => ({ ...current, status: "receiving", message: "正在接收结果..." }));
+            break;
+          case "chunk":
+            chunkCount += 1;
+            totalLength = (data as { totalLength?: number })?.totalLength ?? totalLength;
+            setAnalysisState((current) => current.status === "receiving"
+              ? { ...current, message: `接收中... 已 ${totalLength} 字符` }
+              : current);
+            break;
+          case "done":
+            analysis = (data as { analysis?: unknown })?.analysis ?? null;
+            break;
+          case "error":
+            lastError = (data as { detail?: unknown })?.detail ?? data;
+            break;
+        }
+      };
+
+      // 解析 SSE 帧
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+          for (const frame of frames) {
+            const lines = frame.split("\n");
+            let eventName = "message";
+            const dataParts: string[] = [];
+            for (const line of lines) {
+              if (line.startsWith("event:")) eventName = line.slice(6).trim();
+              else if (line.startsWith("data:")) dataParts.push(line.slice(5).trim());
+            }
+            if (dataParts.length === 0) continue;
+            const dataStr = dataParts.join("\n");
+            let data: unknown = dataStr;
+            try { data = JSON.parse(dataStr); } catch { /* leave as string */ }
+            flushFrame(eventName, data);
+          }
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+
+      if (lastError) throw lastError;
+      if (!analysis) throw new Error("分析流结束但未收到 done 事件");
+
+      const result = normalizePromptAnalysisResult(analysis, {
         ...fallback,
         analysisModel,
         source: "ai",
       });
+      const totalMs = Date.now() - startedAt;
       pushLocalLog({
         type: "prompt_analysis",
         level: "success",
-        title: "提示词分析完成",
+        title: "提示词分析完成（流式）",
         message: result.summary,
         endpoint: "/api/prompt/analyze",
-        durationMs: Date.now() - startedAt,
+        requestId: upstreamRequestId,
+        durationMs: totalMs,
         params: requestParamsForLog,
         response: {
           score: result.score,
           riskLevel: result.riskLevel,
           safe: result.safe,
           source: result.source,
+          stream: {
+            chunkCount,
+            totalLength,
+            firstByteMs: firstByteAt ? firstByteAt - startedAt : null,
+            receivingMs: receivingAt ? receivingAt - startedAt : null,
+            totalMs,
+          },
           analysis: sanitizeClientLogValue(result),
         },
       });
@@ -4136,6 +4251,10 @@ export default function App() {
         durationMs: Date.now() - startedAt,
         params: requestParamsForLog,
         error: safeLogError(error),
+        response: {
+          phase: "stream_error",
+          rawDetail: sanitizeClientLogValue(error),
+        },
       });
       throw error;
     }
@@ -5461,16 +5580,22 @@ export default function App() {
             <div className={`prompt-analysis-panel ${analysisState.status} risk-${analysisResult?.riskLevel || "low"}`}>
               <div className="analysis-panel-head">
                 <div className="analysis-orb" aria-hidden="true">
-                  {analysisState.status === "analyzing" ? <Loader2 size={16} className="spin" /> : <WandSparkles size={16} />}
+                  {(analysisState.status === "analyzing" || analysisState.status === "receiving") ? <Loader2 size={16} className="spin" /> : <WandSparkles size={16} />}
                 </div>
                 <div>
-                  <strong>{analysisState.message || analysisModeLabel(analysisState.mode)}</strong>
+                  <strong>
+                    {analysisState.status === "receiving"
+                      ? "正在接收结果"
+                      : analysisState.message || analysisModeLabel(analysisState.mode)}
+                  </strong>
                   <span>
                     {analysisState.status === "analyzing"
                       ? currentAnalysisMessage
-                      : analysisResult
-                        ? `${analysisSourceLabel} · 评分 ${analysisResult.score}`
-                        : analysisState.error || "可以稍后重试"}
+                      : analysisState.status === "receiving"
+                        ? analysisState.message || "AI 正在流式返回..."
+                        : analysisResult
+                          ? `${analysisSourceLabel} · 评分 ${analysisResult.score}`
+                          : analysisState.error || "可以稍后重试"}
                   </span>
                 </div>
                 <button
@@ -5501,7 +5626,7 @@ export default function App() {
                 </div>
               )}
 
-              {analysisState.status === "analyzing" && (
+              {(analysisState.status === "analyzing" || analysisState.status === "receiving") && (
                 <div className="analysis-scan">
                   <span />
                   <span />

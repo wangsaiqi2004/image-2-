@@ -987,7 +987,19 @@ function normalizeAnalysisPayload(value: unknown, analysisModel: string) {
   };
 }
 
-async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: ProxyBody, requestId?: string) {
+type AnalyzeStreamCallbacks = {
+  onUpstreamConnected?: (status: number) => void;
+  onFirstByte?: () => void;
+  onChunk?: (delta: string, accumulated: string) => void;
+};
+
+async function analyzePromptWithGpt(
+  baseUrl: string,
+  apiKey: string,
+  body: ProxyBody,
+  requestId?: string,
+  callbacks: AnalyzeStreamCallbacks = {},
+) {
   const analysisModel = getString(body, "analysisModel");
   const prompt = getString(body, "prompt");
   if (!analysisModel) throw new Error("分析模型不能为空");
@@ -1029,6 +1041,7 @@ async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: Proxy
     ],
     temperature: 0.2,
     response_format: { type: "json_object" },
+    stream: true,
   };
   if (requestId) {
     updateRequestLog(requestId, {
@@ -1042,34 +1055,123 @@ async function analyzePromptWithGpt(baseUrl: string, apiKey: string, body: Proxy
     headers: {
       Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
+      Accept: "text/event-stream",
     },
     body: JSON.stringify(upstreamPayload),
-  }, 20_000);
-  const text = await response.text();
+  }, 60_000);
+  callbacks.onUpstreamConnected?.(response.status);
   if (!response.ok) {
-    const detail = detailFromUpstream(response.status, text);
+    const errorText = await response.text();
+    const detail = detailFromUpstream(response.status, errorText);
     if (requestId) {
       updateRequestLog(requestId, {
-        responseBody: sanitizeForLog({ ok: false, status: response.status, detail }),
+        responseBody: sanitizeForLog({ ok: false, status: response.status, detail, errorRaw: truncateText(errorText, 2500) }),
       });
     }
     throw detail;
   }
-  const payload = parseMaybeJson(text);
-  const choices = payload && typeof payload === "object" && Array.isArray((payload as { choices?: unknown }).choices)
-    ? (payload as { choices: Array<Record<string, unknown>> }).choices
-    : [];
-  const message = choices[0]?.message;
-  const content = message && typeof message === "object" ? (message as Record<string, unknown>).content : "";
-  const rawContent = typeof content === "string" ? content : JSON.stringify(content || {});
-  const analysis = parseMaybeJson(extractJsonObject(rawContent));
+  if (!response.body) {
+    throw new Error("上游返回空响应体");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let accumulated = "";
+  let firstByteReported = false;
+  let finishReason: string | undefined;
+
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!firstByteReported) {
+        callbacks.onFirstByte?.();
+        firstByteReported = true;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const rawLine of lines) {
+        const line = rawLine.replace(/\r$/, "");
+        if (!line.startsWith("data:")) continue;
+        const dataStr = line.slice(5).trim();
+        if (!dataStr || dataStr === "[DONE]") continue;
+        let chunk: unknown;
+        try {
+          chunk = JSON.parse(dataStr);
+        } catch {
+          continue;
+        }
+        const choice = chunk && typeof chunk === "object"
+          ? ((chunk as { choices?: unknown }).choices as Array<Record<string, unknown>> | undefined)?.[0]
+          : undefined;
+        const delta = choice && typeof choice === "object" ? (choice.delta as Record<string, unknown> | undefined) : undefined;
+        const deltaContent = delta && typeof delta.content === "string" ? delta.content : "";
+        if (deltaContent) {
+          accumulated += deltaContent;
+          callbacks.onChunk?.(deltaContent, accumulated);
+        }
+        if (typeof choice?.finish_reason === "string") {
+          finishReason = choice.finish_reason as string;
+        }
+      }
+    }
+    if (buffer.startsWith("data:")) {
+      const tail = buffer.slice(5).trim();
+      if (tail && tail !== "[DONE]") {
+        try {
+          const chunk = JSON.parse(tail);
+          const deltaContent = (chunk?.choices?.[0]?.delta?.content as string) || "";
+          if (deltaContent) {
+            accumulated += deltaContent;
+            callbacks.onChunk?.(deltaContent, accumulated);
+          }
+        } catch {
+          // ignore trailing partial
+        }
+      }
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+
+  if (!accumulated.trim()) {
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({ ok: false, status: response.status, error: "上游 stream 没有返回任何内容", finishReason }),
+      });
+    }
+    throw new Error("分析模型返回空内容");
+  }
+
+  const analysis = parseMaybeJson(extractJsonObject(accumulated));
   if (!analysis || typeof analysis !== "object") {
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({
+          ok: false,
+          status: response.status,
+          error: "分析模型没有返回可解析的 JSON",
+          finishReason,
+          rawContent: truncateText(accumulated, 4000),
+          accumulatedBytes: Buffer.byteLength(accumulated, "utf8"),
+        }),
+      });
+    }
     throw new Error("分析模型没有返回可解析的 JSON");
   }
   const normalizedAnalysis = normalizeAnalysisPayload(analysis, analysisModel);
   if (requestId) {
     updateRequestLog(requestId, {
-      responseBody: sanitizeForLog({ ok: true, status: response.status, raw: payload, analysis: normalizedAnalysis }),
+      responseBody: sanitizeForLog({
+        ok: true,
+        status: response.status,
+        finishReason,
+        accumulatedBytes: Buffer.byteLength(accumulated, "utf8"),
+        rawContent: truncateText(accumulated, 4000),
+        analysis: normalizedAnalysis,
+      }),
     });
   }
   return normalizedAnalysis;
@@ -1780,6 +1882,26 @@ function imageProxyPlugin(): PluginOption {
         const requestId = randomUUID();
         const startedAt = Date.now();
         let logCreated = false;
+
+        // SSE 框架。一旦第一行写出去 res.statusCode 就锁死了，所以异常路径
+        // 在 send/end 都用 SSE 帧（status: 200，错误塞 event: error）。
+        let sseStarted = false;
+        let chunkCount = 0;
+        let lastChunkAt = 0;
+        const sse = (event: string, data: unknown) => {
+          if (!sseStarted) {
+            res.statusCode = 200;
+            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+            res.setHeader("Cache-Control", "no-cache, no-transform");
+            res.setHeader("Connection", "keep-alive");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.flushHeaders?.();
+            sseStarted = true;
+          }
+          res.write(`event: ${event}\n`);
+          res.write(`data: ${JSON.stringify(data)}\n\n`);
+        };
+
         try {
           const body = await readJsonBody(req);
           const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl"));
@@ -1825,7 +1947,27 @@ function imageProxyPlugin(): PluginOption {
           });
           logCreated = true;
 
-          const analysis = await analyzePromptWithGpt(baseUrl, apiKey, body, requestId);
+          sse("started", { requestId, model: analysisModel, startedAt });
+
+          const analysis = await analyzePromptWithGpt(baseUrl, apiKey, body, requestId, {
+            onUpstreamConnected: (status) => {
+              sse("upstream_connected", { status, elapsedMs: Date.now() - startedAt });
+            },
+            onFirstByte: () => {
+              sse("receiving", { elapsedMs: Date.now() - startedAt });
+              if (logCreated) {
+                updateRequestLog(requestId, {
+                  upstreamRequest: undefined as never,  // 留空，避免覆盖之前 sanitizeForLog 写入的内容
+                });
+              }
+            },
+            onChunk: (delta, accumulated) => {
+              chunkCount += 1;
+              lastChunkAt = Date.now();
+              sse("chunk", { delta, totalLength: accumulated.length });
+            },
+          });
+
           const finishedAt = Date.now();
           updateRequestLog(requestId, {
             status: "success",
@@ -1833,7 +1975,8 @@ function imageProxyPlugin(): PluginOption {
             finishedAt,
             durationMs: finishedAt - startedAt,
           });
-          sendJson(res, 200, { ok: true, requestId, analysis });
+          sse("done", { requestId, analysis, durationMs: finishedAt - startedAt, chunkCount });
+          res.end();
         } catch (error) {
           const detail = error && typeof error === "object" && "error" in error
             ? error
@@ -1849,16 +1992,23 @@ function imageProxyPlugin(): PluginOption {
               errorType: summary.type || "prompt_analysis_error",
               errorCode: summary.code,
               errorRaw: summary.raw,
-              responseBody: sanitizeForLog({ ok: false, status, detail }),
+              responseBody: sanitizeForLog({
+                ok: false,
+                status,
+                detail,
+                chunkCount,
+                lastChunkAt: lastChunkAt ? lastChunkAt - startedAt : null,
+              }),
               finishedAt,
               durationMs: finishedAt - startedAt,
             });
           }
-          sendJson(res, status, {
-            ok: false,
-            requestId,
-            detail,
-          });
+          if (sseStarted) {
+            sse("error", { requestId, status, detail, chunkCount });
+            res.end();
+          } else {
+            sendJson(res, status, { ok: false, requestId, detail });
+          }
         }
       });
 
