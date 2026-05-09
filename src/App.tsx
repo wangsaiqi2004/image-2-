@@ -2,6 +2,7 @@ import {
   AlertCircle,
   ArrowRight,
   BarChart3,
+  Bot,
   CheckCircle2,
   Clock3,
   ChevronRight,
@@ -177,7 +178,7 @@ type ModelLoadState = {
 };
 
 type LocalLogLevel = "info" | "success" | "warning" | "error";
-type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation";
+type LocalLogType = "model_load" | "api_health" | "prompt_analysis" | "image_generation" | "agent_analysis";
 
 type ReferenceUploadStatus =
   | "none"
@@ -340,6 +341,63 @@ type AnalysisCountdown = {
   label: string;
 };
 
+type AgentModeIntentType = "single_image" | "multi_image_batch" | "brochure_project" | "page_refine" | "unknown";
+type AgentModeCostLevel = "low" | "medium" | "high";
+type AgentModeStatus = "idle" | "analyzing" | "needs_confirmation" | "planned" | "executing" | "error";
+
+type AgentModeJobSpec = {
+  id: string;
+  title: string;
+  prompt: string;
+  objective?: string;
+  negativePrompt?: string;
+  aspectRatio?: string;
+  size?: string;
+  resolution?: ImageResolution;
+  quality?: string;
+  count?: number;
+};
+
+type AgentModeBrochurePage = {
+  pageNo: number;
+  role: string;
+  title: string;
+  objective: string;
+};
+
+type AgentModeBrochureProject = {
+  title: string;
+  companyName?: string;
+  industry?: string;
+  purpose?: string;
+  pageCount: number;
+  summary: string;
+  outline: AgentModeBrochurePage[];
+  styleDirections: string[];
+  requestPrompt?: string;
+};
+
+type AgentModeAnalysisResult = {
+  intentType: AgentModeIntentType;
+  confidence: number;
+  reasoningSummary: string;
+  estimatedCostLevel: AgentModeCostLevel;
+  requiresConfirmation: boolean;
+  autoExecute: boolean;
+  jobs: AgentModeJobSpec[];
+  brochureProject?: AgentModeBrochureProject;
+  analysisModel?: string;
+  source?: "ai" | "local";
+};
+
+type AgentModeState = {
+  status: AgentModeStatus;
+  message: string;
+  requestId?: string;
+  error?: string;
+  result?: AgentModeAnalysisResult;
+};
+
 type PreviewItem = {
   id: string;
   requestId?: string;
@@ -371,7 +429,7 @@ type AdminUserView = {
 
 type AdminRequestLog = {
   requestId: string;
-  requestType?: "image_generation" | "prompt_analysis";
+  requestType?: "image_generation" | "prompt_analysis" | "agent_analysis";
   batchId?: string;
   batchIndex?: number;
   batchTotal?: number;
@@ -442,6 +500,8 @@ const LARGE_REFERENCE_EDGE = 4096;
 const PROMPT_TEXTAREA_MAX_HEIGHT = 220;
 const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const API_KEY_MIN_LENGTH = 8;
+const AGENT_MODE_STORAGE_KEY = "imageStudioAgentModeEnabled";
+const AGENT_MODE_NAME = "Agent 模式 A";
 const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   ? __FRONTEND_BUILD_VERSION__
   : "dev";
@@ -2602,6 +2662,128 @@ function normalizePromptAnalysisResult(value: unknown, fallback: PromptAnalysisR
   };
 }
 
+function safeAgentModeIntentType(value: unknown): AgentModeIntentType {
+  return value === "single_image"
+    || value === "multi_image_batch"
+    || value === "brochure_project"
+    || value === "page_refine"
+    || value === "unknown"
+    ? value
+    : "unknown";
+}
+
+function safeAgentModeCostLevel(value: unknown): AgentModeCostLevel {
+  return value === "low" || value === "medium" || value === "high" ? value : "low";
+}
+
+function normalizeAgentModeJobSpec(value: unknown, index: number): AgentModeJobSpec | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" && record.title.trim() ? record.title.trim() : `任务 ${index + 1}`;
+  const prompt = typeof record.prompt === "string" ? record.prompt.trim() : "";
+  if (!prompt) return null;
+  return {
+    id: typeof record.id === "string" && record.id.trim() ? record.id : `agent-job-${index + 1}`,
+    title,
+    prompt,
+    objective: typeof record.objective === "string" ? record.objective.trim() : "",
+    negativePrompt: typeof record.negativePrompt === "string" ? record.negativePrompt.trim() : "",
+    aspectRatio: typeof record.aspectRatio === "string" ? record.aspectRatio.trim() : "",
+    size: typeof record.size === "string" ? record.size.trim() : "",
+    resolution: isImageResolution(record.resolution) ? record.resolution : undefined,
+    quality: typeof record.quality === "string" ? record.quality.trim() : "",
+    count: typeof record.count === "number" ? clampNumber(record.count, 1, 8) : 1,
+  };
+}
+
+function normalizeAgentModeBrochurePage(value: unknown, index: number): AgentModeBrochurePage | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" && record.title.trim() ? record.title.trim() : `第 ${index + 1} 页`;
+  return {
+    pageNo: typeof record.pageNo === "number" ? clampNumber(record.pageNo, 1, 64) : index + 1,
+    role: typeof record.role === "string" && record.role.trim() ? record.role.trim() : "content",
+    title,
+    objective: typeof record.objective === "string" && record.objective.trim()
+      ? record.objective.trim()
+      : `${title} 页面主视觉`,
+  };
+}
+
+function normalizeAgentModeBrochureProject(value: unknown, promptText: string): AgentModeBrochureProject | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as Record<string, unknown>;
+  const title = typeof record.title === "string" && record.title.trim() ? record.title.trim() : "宣传画册项目";
+  const outline = Array.isArray(record.outline)
+    ? record.outline
+      .map(normalizeAgentModeBrochurePage)
+      .filter(Boolean) as AgentModeBrochurePage[]
+    : [];
+  const styleDirections = Array.isArray(record.styleDirections)
+    ? record.styleDirections
+      .filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+      .slice(0, 6)
+    : [];
+  return {
+    title,
+    companyName: typeof record.companyName === "string" ? record.companyName.trim() : "",
+    industry: typeof record.industry === "string" ? record.industry.trim() : "",
+    purpose: typeof record.purpose === "string" ? record.purpose.trim() : "",
+    pageCount: typeof record.pageCount === "number" ? clampNumber(record.pageCount, 4, 32) : Math.max(outline.length, 4),
+    summary: typeof record.summary === "string" && record.summary.trim()
+      ? record.summary.trim()
+      : "已识别为宣传画册任务，建议先选择整本模板方向，再展开单页生成。",
+    outline,
+    styleDirections,
+    requestPrompt: promptText,
+  };
+}
+
+function normalizeAgentModeAnalysisResult(value: unknown, promptText: string): AgentModeAnalysisResult {
+  const fallback: AgentModeAnalysisResult = {
+    intentType: "single_image",
+    confidence: 0.6,
+    reasoningSummary: "未拿到完整解析结果，已按单图任务处理。",
+    estimatedCostLevel: "low",
+    requiresConfirmation: false,
+    autoExecute: true,
+    jobs: [{
+      id: "agent-job-1",
+      title: "图片生成",
+      prompt: promptText.trim(),
+      count: 1,
+    }],
+    source: "local",
+  };
+  if (!value || typeof value !== "object") return fallback;
+  const record = value as Record<string, unknown>;
+  const jobs = Array.isArray(record.jobs)
+    ? record.jobs
+      .map(normalizeAgentModeJobSpec)
+      .filter(Boolean) as AgentModeJobSpec[]
+    : [];
+  const brochureProject = normalizeAgentModeBrochureProject(record.brochureProject, promptText);
+  const intentType = safeAgentModeIntentType(record.intentType);
+  return {
+    intentType,
+    confidence: typeof record.confidence === "number" ? clampNumber(record.confidence, 0, 1) : fallback.confidence,
+    reasoningSummary: typeof record.reasoningSummary === "string" && record.reasoningSummary.trim()
+      ? record.reasoningSummary.trim()
+      : fallback.reasoningSummary,
+    estimatedCostLevel: safeAgentModeCostLevel(record.estimatedCostLevel),
+    requiresConfirmation: typeof record.requiresConfirmation === "boolean"
+      ? record.requiresConfirmation
+      : intentType !== "single_image",
+    autoExecute: typeof record.autoExecute === "boolean"
+      ? record.autoExecute
+      : intentType === "single_image" && jobs.length > 0,
+    jobs: jobs.length > 0 ? jobs : fallback.jobs,
+    brochureProject,
+    analysisModel: typeof record.analysisModel === "string" ? record.analysisModel : undefined,
+    source: record.source === "ai" || record.source === "local" ? record.source : fallback.source,
+  };
+}
+
 function createJob(
   index: number,
   total: number,
@@ -2697,6 +2879,15 @@ export default function App() {
   const [lastAppliedAgent, setLastAppliedAgent] = useState<AgentContext | null>(null);
   const [localLogs, setLocalLogs] = useState<LocalLogEntry[]>(loadLocalLogs);
   const [isLocalLogOpen, setIsLocalLogOpen] = useState(false);
+  const [isAgentModeEnabled, setIsAgentModeEnabled] = useState(() =>
+    loadBooleanSetting(AGENT_MODE_STORAGE_KEY, false),
+  );
+  const [agentModeState, setAgentModeState] = useState<AgentModeState>({
+    status: "idle",
+    message: "",
+  });
+  const [agentModePendingPlan, setAgentModePendingPlan] = useState<AgentModeAnalysisResult | null>(null);
+  const [agentModeBrochureDraft, setAgentModeBrochureDraft] = useState<AgentModeBrochureProject | null>(null);
   const [analysisCountdown, setAnalysisCountdown] = useState<AnalysisCountdown | null>(null);
   const [isComposerCollapsed, setIsComposerCollapsed] = useState(false);
   const [isBulkDownloading, setIsBulkDownloading] = useState(false);
@@ -2794,6 +2985,12 @@ export default function App() {
   );
   const isAgentEnabled = Boolean(selectedAgent);
   const latestLocalLogLevel = localLogs[0]?.level;
+  const isAgentModeBusy = isAgentModeEnabled && (
+    agentModeState.status === "analyzing"
+    || agentModeState.status === "executing"
+    || agentModeState.status === "needs_confirmation"
+    || agentModeState.status === "planned"
+  );
   const modelStatusMessage = isAutoLoadingModels
     ? "正在自动验证 API Key 并读取 image-2 模型..."
     : isModelConnectionVerified && verifiedModelAt
@@ -2807,7 +3004,7 @@ export default function App() {
     models.includes(selectedModel) &&
     isModelConnectionVerified &&
     aspectRatioSupported;
-  const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown;
+  const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown && !isAgentModeBusy;
 
   useEffect(() => {
     void loadMainRecordsPage();
@@ -2916,6 +3113,29 @@ export default function App() {
       setAnalysisState({ status: "idle", mode: "send", message: "" });
     }
   }, [isAutoPromptAnalysisEnabled, analysisState.mode]);
+
+  useEffect(() => {
+    localStorage.setItem(AGENT_MODE_STORAGE_KEY, String(isAgentModeEnabled));
+  }, [isAgentModeEnabled]);
+
+  useEffect(() => {
+    if (!isAgentModeEnabled) {
+      setAgentModeState({ status: "idle", message: "" });
+      setAgentModePendingPlan(null);
+      setAgentModeBrochureDraft(null);
+      return;
+    }
+    cancelAnalysisCountdown();
+    setAnalysisState({ status: "idle", mode: "send", message: "" });
+    setShowPromptPresets(false);
+    setIsAgentPanelOpen(false);
+    setAgentModeState({
+      status: "idle",
+      message: "告诉我你想做一张图、一组不同图片，或者一本宣传画册。",
+    });
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+  }, [isAgentModeEnabled]);
 
   useEffect(() => {
     if (isAspectRatioSupported(apiConfig.protocol, params.aspectRatio)) return;
@@ -3303,6 +3523,7 @@ export default function App() {
     const incomingFiles = Array.from(files);
     if (incomingFiles.length === 0) return;
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setIsComposerCollapsed(false);
     const nextImages = await Promise.all(incomingFiles.slice(0, REFERENCE_LIMIT).map(fileToReference));
     setReferenceImages((current) => [...current, ...nextImages].slice(0, REFERENCE_LIMIT));
@@ -4564,6 +4785,241 @@ export default function App() {
     }
   }
 
+  function buildAgentModeJobParams(spec: AgentModeJobSpec, baseParams = params): ImageParams {
+    const recommendedRatio = spec.aspectRatio || recommendAspectRatioForPrompt(spec.prompt, baseParams.aspectRatio);
+    const aspectRatio = isAspectRatioSupported(apiConfig.protocol, recommendedRatio)
+      ? recommendedRatio
+      : getSupportedAspectRatios(apiConfig.protocol)[0] || baseParams.aspectRatio;
+    const resolution = spec.resolution ? safeImageResolution(spec.resolution) : safeImageResolution(baseParams.resolution);
+    return {
+      ...baseParams,
+      aspectRatio,
+      resolution,
+      size: spec.size || resolveSize(aspectRatio, resolution),
+      quality: spec.quality || baseParams.quality,
+      batchCount: 1,
+      negativePrompt: spec.negativePrompt || baseParams.negativePrompt,
+    };
+  }
+
+  function enqueueAgentModeJobs(
+    specs: AgentModeJobSpec[],
+    options: {
+      analysisResult: AgentModeAnalysisResult;
+      clearComposer?: boolean;
+      scenarioLabel?: string;
+    },
+  ) {
+    const expandedSpecs = specs.flatMap((spec) =>
+      Array.from({ length: clampNumber(Number(spec.count) || 1, 1, 8) }, () => spec),
+    );
+    if (expandedSpecs.length === 0) return;
+    const snapshotConfig = { ...apiConfig };
+    const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
+      ? usableReferenceImages
+      : [];
+    const batchId = uid();
+    const batchCreatedAt = Date.now();
+    const nextJobs = expandedSpecs.map((spec, index) => {
+      const baseJob = createJob(
+        index + 1,
+        expandedSpecs.length,
+        batchId,
+        apiConfig.protocol,
+        spec.prompt,
+        selectedModel,
+        buildAgentModeJobParams(spec),
+        snapshotReferenceImages,
+        batchCreatedAt - index / 1000,
+      );
+      return {
+        ...baseJob,
+        agentId: "agent-mode-a",
+        agentName: AGENT_MODE_NAME,
+        agentScenario: spec.title || options.scenarioLabel || options.analysisResult.intentType,
+      };
+    });
+    setHighlightedRecordId("");
+    setVisibleRecords((current) => sortGenerationRecords([...nextJobs, ...current]));
+    enqueueJobs(nextJobs, snapshotConfig);
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+    setAgentModeState({
+      status: "executing",
+      message: `已提交 ${nextJobs.length} 个任务到生成队列。`,
+      result: options.analysisResult,
+    });
+    if (options.clearComposer !== false) {
+      setPrompt("");
+      setReferenceImages([]);
+      setLastAppliedAgent(null);
+    }
+  }
+
+  function buildBrochureStyleBoardPrompt(project: AgentModeBrochureProject, direction: string, boardIndex: number) {
+    const outlineText = project.outline
+      .slice(0, 12)
+      .map((page) => `${page.pageNo}. ${page.title}：${page.objective}`)
+      .join("；");
+    const company = project.companyName || project.title;
+    const industry = project.industry || "企业品牌";
+    const purpose = project.purpose || "公司宣传";
+    return [
+      `为「${company}」设计一张公司宣传画册模板板。`,
+      `项目类型：${industry} 行业的 ${purpose} 画册，共 ${project.pageCount} 页。`,
+      "请输出一张整本方案图，在同一张图中展示封面和全部内页的缩略版式，不需要真实小字，但必须让页面层级、主视觉和版式节奏清晰可见。",
+      `风格方向：${direction}。`,
+      `页面结构：${outlineText}。`,
+      "要求整本风格统一、封面辨识度高、内页节奏分明、适合商务宣传画册模板探索，像设计提案板而不是最终可印刷文件。",
+      `这是第 ${boardIndex + 1} 套候选方向，请拉开与其他方案的视觉差异。`,
+    ].join(" ");
+  }
+
+  function submitBrochureStyleBoards(project: AgentModeBrochureProject) {
+    const styleDirections = project.styleDirections.length > 0
+      ? project.styleDirections.slice(0, 4)
+      : ["科技蓝信息栅格", "高端杂志感", "制造业目录感", "招商海报感"];
+    const specs = styleDirections.map((direction, index) => ({
+      id: `brochure-style-${index + 1}`,
+      title: `模板板 ${index + 1} · ${direction}`,
+      prompt: buildBrochureStyleBoardPrompt(project, direction, index),
+      aspectRatio: "4:3",
+      resolution: "2K" as ImageResolution,
+      quality: "high",
+      count: 1,
+    }));
+    enqueueAgentModeJobs(specs, {
+      analysisResult: {
+        intentType: "brochure_project",
+        confidence: 1,
+        reasoningSummary: project.summary,
+        estimatedCostLevel: "medium",
+        requiresConfirmation: true,
+        autoExecute: false,
+        jobs: specs,
+        brochureProject: project,
+        source: "local",
+      },
+      clearComposer: false,
+      scenarioLabel: "宣传画册模板板",
+    });
+  }
+
+  async function requestAgentModeExecution(submittedPrompt: string) {
+    const analysisModel = preferredAnalysisModel;
+    const requestStartedAt = Date.now();
+    const payload = {
+      baseUrl: normalizeApiBaseUrl(apiConfig.baseUrl),
+      apiKey: apiConfig.apiKey,
+      clientId: getClientId(),
+      analysisModel,
+      prompt: submittedPrompt,
+      protocol: apiConfig.protocol,
+      imageModel: selectedModel,
+      aspectRatio: params.aspectRatio,
+      size: params.size || resolveSize(params.aspectRatio, params.resolution),
+      resolution: params.resolution,
+      quality: params.quality,
+      outputFormat: params.outputFormat,
+      count: params.batchCount,
+      referenceCount: usableReferenceImages.length,
+    };
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+    setAgentModeState({
+      status: "analyzing",
+      message: `${AGENT_MODE_NAME} 正在理解你的任务并自动编排。`,
+    });
+    pushLocalLog({
+      type: "agent_analysis",
+      level: "info",
+      title: `${AGENT_MODE_NAME} 开始解析`,
+      message: "正在识别单图、多图还是宣传画册任务。",
+      endpoint: "/api/agent/analyze",
+      params: {
+        ...apiLogSnapshot(),
+        prompt: truncateForLog(submittedPrompt),
+        analysisModel,
+        referenceCount: usableReferenceImages.length,
+      },
+    });
+    try {
+      const response = await fetch("/api/agent/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const resultPayload = await readApiJson<{
+        ok?: boolean;
+        requestId?: string;
+        analysis?: unknown;
+        detail?: unknown;
+      }>(response, "/api/agent/analyze");
+      if (!response.ok || !resultPayload.ok) {
+        throw resultPayload.detail || resultPayload;
+      }
+      const result = normalizeAgentModeAnalysisResult(resultPayload.analysis, submittedPrompt);
+      pushLocalLog({
+        type: "agent_analysis",
+        level: "success",
+        title: `${AGENT_MODE_NAME} 解析完成`,
+        message: result.reasoningSummary,
+        endpoint: "/api/agent/analyze",
+        requestId: resultPayload.requestId,
+        durationMs: Date.now() - requestStartedAt,
+        params: {
+          ...apiLogSnapshot(),
+          prompt: truncateForLog(submittedPrompt),
+        },
+        response: sanitizeClientLogValue(result) as Record<string, unknown>,
+      });
+      if (result.intentType === "brochure_project" && result.brochureProject) {
+        setAgentModeBrochureDraft(result.brochureProject);
+        setAgentModeState({
+          status: "planned",
+          message: "已识别为宣传画册任务，请先确认页结构和模板方向。",
+          requestId: resultPayload.requestId,
+          result,
+        });
+        return;
+      }
+      if (result.requiresConfirmation || result.intentType === "multi_image_batch") {
+        setAgentModePendingPlan(result);
+        setAgentModeState({
+          status: "needs_confirmation",
+          message: `已拆解出 ${result.jobs.length} 个独立任务，确认后进入队列。`,
+          requestId: resultPayload.requestId,
+          result,
+        });
+        return;
+      }
+      enqueueAgentModeJobs(result.jobs, {
+        analysisResult: result,
+        clearComposer: true,
+        scenarioLabel: "自动拆解任务",
+      });
+    } catch (error) {
+      setAgentModeState({
+        status: "error",
+        message: "Agent 解析失败，请调整描述后重试。",
+        error: formatError(error),
+      });
+      pushLocalLog({
+        type: "agent_analysis",
+        level: "error",
+        title: `${AGENT_MODE_NAME} 解析失败`,
+        message: formatError(error),
+        endpoint: "/api/agent/analyze",
+        durationMs: Date.now() - requestStartedAt,
+        params: {
+          ...apiLogSnapshot(),
+          prompt: truncateForLog(submittedPrompt),
+        },
+        error: safeLogError(error),
+      });
+    }
+  }
+
   async function requestStartBatch() {
     if (!canRequestGenerate) return;
     const nextStart = performance.now();
@@ -4572,6 +5028,11 @@ export default function App() {
     const apiKeyReady = await verifyApiKeyBeforeGeneration();
     if (!apiKeyReady) return;
     const submittedPrompt = prompt.trim();
+    if (isAgentModeEnabled) {
+      triggerSendLaunchAnimation();
+      void requestAgentModeExecution(submittedPrompt);
+      return;
+    }
     const snapshotReferenceImages = getProtocolDefinition(apiConfig.protocol).supportsReferenceImages
       ? usableReferenceImages
       : [];
@@ -4726,17 +5187,29 @@ export default function App() {
     successfulVisibleRecords.forEach((job) => downloadCurrent(job));
   }
 
+  function clearAgentModeDrafts() {
+    setAgentModePendingPlan(null);
+    setAgentModeBrochureDraft(null);
+    setAgentModeState((current) =>
+      current.status === "idle"
+        ? current
+        : { status: "idle", message: isAgentModeEnabled ? "输入已更新，等待重新理解需求。" : "" },
+    );
+  }
+
   function copyPrompt(text: string) {
     void navigator.clipboard.writeText(text);
   }
 
   function removeReference(id: string) {
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setReferenceImages((current) => current.filter((image) => image.id !== id));
   }
 
   function applyPromptStarter(nextPrompt: string) {
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setIsComposerCollapsed(false);
     setPrompt((current) => (current.trim() ? `${current.trim()}\n${nextPrompt}` : nextPrompt));
     setShowPromptPresets(false);
@@ -4745,6 +5218,7 @@ export default function App() {
 
   function updatePromptValue(nextPrompt: string) {
     cancelAnalysisCountdown();
+    clearAgentModeDrafts();
     setIsComposerCollapsed(false);
     setPrompt(nextPrompt);
   }
@@ -5237,6 +5711,7 @@ export default function App() {
             isPromptAnalyzing ? "is-analyzing" : "",
             isComposerCollapsed ? "is-collapsed" : "",
             isAgentPanelOpen ? "has-agent-panel" : "",
+            isAgentModeEnabled ? "is-agent-mode" : "",
           ].filter(Boolean).join(" ")}
           data-onboarding-target="composer"
           onSubmit={(event) => {
@@ -5261,97 +5736,104 @@ export default function App() {
               <Send size={16} />
             </button>
           )}
-          <div className="agent-quickbar">
-            <button
-              type="button"
-              className={[
-                "agent-entry-button",
-                lastAppliedAgent ? "is-active" : isAgentEnabled ? "is-enabled" : "is-muted",
-                !isAgentHintSeen ? "needs-attention" : "",
-              ].filter(Boolean).join(" ")}
-              title={
-                lastAppliedAgent
-                  ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用到当前提示词`
-                  : isAgentEnabled
-                    ? "已选行业，点开面板应用 variant"
-                    : "打开行业 Agent 选择器"
-              }
-              onClick={() => openAgentPanel()}
-            >
-              <WandSparkles size={15} />
-              {lastAppliedAgent
-                ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用`
-                : isAgentEnabled
-                  ? `${selectedAgent?.name || "行业 Agent"} · 已选`
-                  : "行业 Agent · 未启用"}
-              <ChevronRight size={14} />
-              <small>
-                {lastAppliedAgent ? "送出后清" : isAgentEnabled ? "可应用" : "可开启"}
-              </small>
-            </button>
-            {isAgentEnabled && (
+          <AgentModeSwitch
+            enabled={isAgentModeEnabled}
+            status={agentModeState.status}
+            onToggle={() => setIsAgentModeEnabled((value) => !value)}
+          />
+          {!isAgentModeEnabled && (
+            <div className="agent-quickbar">
               <button
                 type="button"
-                className="agent-disable-button"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  disableAgent();
-                }}
-                title="停用行业 Agent"
-                aria-label="停用行业 Agent"
+                className={[
+                  "agent-entry-button",
+                  lastAppliedAgent ? "is-active" : isAgentEnabled ? "is-enabled" : "is-muted",
+                  !isAgentHintSeen ? "needs-attention" : "",
+                ].filter(Boolean).join(" ")}
+                title={
+                  lastAppliedAgent
+                    ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用到当前提示词`
+                    : isAgentEnabled
+                      ? "已选行业，点开面板应用 variant"
+                      : "打开行业 Agent 选择器"
+                }
+                onClick={() => openAgentPanel()}
               >
-                <X size={13} />
+                <WandSparkles size={15} />
+                {lastAppliedAgent
+                  ? `${lastAppliedAgent.plan.agentName} · ${PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]} 已应用`
+                  : isAgentEnabled
+                    ? `${selectedAgent?.name || "行业 Agent"} · 已选`
+                    : "行业 Agent · 未启用"}
+                <ChevronRight size={14} />
+                <small>
+                  {lastAppliedAgent ? "送出后清" : isAgentEnabled ? "可应用" : "可开启"}
+                </small>
               </button>
-            )}
-            {lastAppliedAgent && (
-              <div className="agent-applied-chip" role="status">
-                <WandSparkles size={12} />
-                <span>{lastAppliedAgent.plan.agentName} · {PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]}</span>
+              {isAgentEnabled && (
                 <button
                   type="button"
-                  className="agent-applied-chip-clear"
-                  onClick={() => setLastAppliedAgent(null)}
-                  title="清除 Agent 标签（保留提示词）"
-                  aria-label="清除 Agent 标签"
+                  className="agent-disable-button"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    disableAgent();
+                  }}
+                  title="停用行业 Agent"
+                  aria-label="停用行业 Agent"
                 >
-                  <X size={11} />
+                  <X size={13} />
                 </button>
-              </div>
-            )}
-            <button
-              type="button"
-              className="agent-expand-button"
-              onClick={() => setIsAgentQuickbarExpanded((value) => !value)}
-              aria-expanded={isAgentQuickbarExpanded}
-              title={isAgentQuickbarExpanded ? "收起行业 Agent 快捷入口" : "展开行业 Agent 快捷入口"}
-            >
-              {isAgentQuickbarExpanded ? "收起" : "展开"}
-              <ChevronRight size={13} />
-            </button>
-            {isAgentHintVisible && (
-              <div className="agent-entry-hint" role="status">
-                选择行业工作流，不填也能生成标准图
-              </div>
-            )}
-            {isAgentQuickbarExpanded && (
-              <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
-                {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
+              )}
+              {lastAppliedAgent && (
+                <div className="agent-applied-chip" role="status">
+                  <WandSparkles size={12} />
+                  <span>{lastAppliedAgent.plan.agentName} · {PROMPT_VARIANT_LABELS[lastAppliedAgent.variant]}</span>
                   <button
                     type="button"
-                    key={agent.id}
-                    className={`agent-chip ${selectedAgentId === agent.id ? "active" : ""}`}
-                    title={agent.clickHint}
-                    onClick={() => openAgentPanel(agent.id)}
+                    className="agent-applied-chip-clear"
+                    onClick={() => setLastAppliedAgent(null)}
+                    title="清除 Agent 标签（保留提示词）"
+                    aria-label="清除 Agent 标签"
                   >
-                    <span>{agent.icon}</span>
-                    {agent.name}
-                    <small>{selectedAgentId === agent.id ? "已选" : "开启"}</small>
-                    <ChevronRight size={12} />
+                    <X size={11} />
                   </button>
-                ))}
-              </div>
-            )}
-          </div>
+                </div>
+              )}
+              <button
+                type="button"
+                className="agent-expand-button"
+                onClick={() => setIsAgentQuickbarExpanded((value) => !value)}
+                aria-expanded={isAgentQuickbarExpanded}
+                title={isAgentQuickbarExpanded ? "收起行业 Agent 快捷入口" : "展开行业 Agent 快捷入口"}
+              >
+                {isAgentQuickbarExpanded ? "收起" : "展开"}
+                <ChevronRight size={13} />
+              </button>
+              {isAgentHintVisible && (
+                <div className="agent-entry-hint" role="status">
+                  选择行业工作流，不填也能生成标准图
+                </div>
+              )}
+              {isAgentQuickbarExpanded && (
+                <div className="agent-chip-row" aria-label="行业 Agent 快捷入口">
+                  {INDUSTRY_AGENTS.slice(0, 8).map((agent) => (
+                    <button
+                      type="button"
+                      key={agent.id}
+                      className={`agent-chip ${selectedAgentId === agent.id ? "active" : ""}`}
+                      title={agent.clickHint}
+                      onClick={() => openAgentPanel(agent.id)}
+                    >
+                      <span>{agent.icon}</span>
+                      {agent.name}
+                      <small>{selectedAgentId === agent.id ? "已选" : "开启"}</small>
+                      <ChevronRight size={12} />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {isAgentPanelOpen && (
             <div className="agent-modal">
               <button
@@ -5528,7 +6010,17 @@ export default function App() {
               </section>
             </div>
           )}
-          {showPromptPresets && (
+          {isAgentModeEnabled && (
+            <AgentModeStatusPanel
+              state={agentModeState}
+              onClear={() => {
+                setAgentModePendingPlan(null);
+                setAgentModeBrochureDraft(null);
+                setAgentModeState({ status: "idle", message: "" });
+              }}
+            />
+          )}
+          {!isAgentModeEnabled && showPromptPresets && (
             <div className="prompt-presets-panel">
               <div className="prompt-presets-head">
                 <div>
@@ -5590,7 +6082,7 @@ export default function App() {
               ))}
             </div>
           )}
-          {analysisState.status !== "idle" && (
+          {!isAgentModeEnabled && analysisState.status !== "idle" && (
             <div className={`prompt-analysis-panel ${analysisState.status} risk-${analysisResult?.riskLevel || "low"}`}>
               <div className="analysis-panel-head">
                 <div className="analysis-orb" aria-hidden="true">
@@ -5752,7 +6244,7 @@ export default function App() {
               )}
             </div>
           )}
-          <div className="composer-main">
+          <div className={`composer-main ${isAgentModeEnabled ? "is-agent-mode" : ""}`}>
             <button
               type="button"
               className="icon-button upload-button"
@@ -5761,16 +6253,18 @@ export default function App() {
             >
               <UploadCloud size={19} />
             </button>
-            <button
-              type="button"
-              className={`icon-button preset-toggle-button ${!showPromptPresets && !prompt.trim() ? "is-guiding" : ""}`}
-              title={showPromptPresets ? "收起预设提示词" : "查看预设提示词"}
-              aria-expanded={showPromptPresets}
-              onClick={() => setShowPromptPresets((value) => !value)}
-            >
-              <WandSparkles size={18} />
-              <span>预设</span>
-            </button>
+            {!isAgentModeEnabled && (
+              <button
+                type="button"
+                className={`icon-button preset-toggle-button ${!showPromptPresets && !prompt.trim() ? "is-guiding" : ""}`}
+                title={showPromptPresets ? "收起预设提示词" : "查看预设提示词"}
+                aria-expanded={showPromptPresets}
+                onClick={() => setShowPromptPresets((value) => !value)}
+              >
+                <WandSparkles size={18} />
+                <span>预设</span>
+              </button>
+            )}
             <textarea
               ref={promptTextareaRef}
               value={prompt}
@@ -5782,27 +6276,41 @@ export default function App() {
                   requestStartBatch();
                 }
               }}
-              placeholder="描述你想生成的图片..."
+              placeholder={
+                isAgentModeEnabled
+                  ? "上传参考图后，直接描述你想做一张图、一组不同图片，或一本宣传画册..."
+                  : "描述你想生成的图片..."
+              }
               aria-label="提示词"
               rows={1}
             />
-            <button
-              type="button"
-              className={`composer-config-button ${isSettingsOpen ? "active" : ""}`}
-              title={`打开生成配置：${composerConfigSummary} · ${composerConfigDetail}`}
-              aria-label={`打开生成配置，当前 ${composerConfigSummary}`}
-              onClick={() => setIsSettingsOpen(true)}
-            >
-              <Settings2 size={15} />
-              <span>{params.batchCount}张</span>
-              <span>{params.aspectRatio}</span>
-              <span>{selectedResolution}</span>
-            </button>
+            {!isAgentModeEnabled && (
+              <button
+                type="button"
+                className={`composer-config-button ${isSettingsOpen ? "active" : ""}`}
+                title={`打开生成配置：${composerConfigSummary} · ${composerConfigDetail}`}
+                aria-label={`打开生成配置，当前 ${composerConfigSummary}`}
+                onClick={() => setIsSettingsOpen(true)}
+              >
+                <Settings2 size={15} />
+                <span>{params.batchCount}张</span>
+                <span>{params.aspectRatio}</span>
+                <span>{selectedResolution}</span>
+              </button>
+            )}
             <button
               type="button"
               className={`send-button${isSendLaunching ? " is-launching" : ""}`}
-              title={isPromptAnalyzing ? "正在分析提示词" : "生成"}
-              aria-label="生成图片"
+              title={
+                isAgentModeEnabled
+                  ? agentModeState.status === "analyzing"
+                    ? "正在理解任务"
+                    : "开始由 Agent 自动编排"
+                  : isPromptAnalyzing
+                    ? "正在分析提示词"
+                    : "生成"
+              }
+              aria-label={isAgentModeEnabled ? "开始 Agent 编排" : "生成图片"}
               disabled={!canRequestGenerate}
               onPointerDown={(event) => {
                 if (event.button !== 0) return;
@@ -5822,41 +6330,45 @@ export default function App() {
               </span>
             </button>
           </div>
-          <div className="prompt-assist-bar" aria-label="智能创作工具">
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("optimize")}>
-              <WandSparkles size={14} />
-              优化提示词
-            </button>
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("params")}>
-              <Settings2 size={14} />
-              参数推荐
-            </button>
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("risk")}>
-              <ShieldCheck size={14} />
-              失败预判
-            </button>
-            <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("style")}>
-              <WandSparkles size={14} />
-              风格增强
-            </button>
-          </div>
-          <div className="composer-meta">
-            <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
-              {referenceMetaLabel}
-            </span>
-            <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
-              {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
-            </span>
-            <label className="composer-auto-toggle" title="发送前自动优化提示词">
-              <input
-                type="checkbox"
-                checked={isAutoPromptAnalysisEnabled}
-                onChange={(event) => setIsAutoPromptAnalysisEnabled(event.target.checked)}
-              />
-              <span>发送前优化</span>
-            </label>
-            <span>{prompt.trim().length} 字</span>
-          </div>
+          {!isAgentModeEnabled && (
+            <>
+              <div className="prompt-assist-bar" aria-label="智能创作工具">
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("optimize")}>
+                  <WandSparkles size={14} />
+                  优化提示词
+                </button>
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("params")}>
+                  <Settings2 size={14} />
+                  参数推荐
+                </button>
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("risk")}>
+                  <ShieldCheck size={14} />
+                  失败预判
+                </button>
+                <button type="button" disabled={!prompt.trim() || isPromptAnalyzing} onClick={() => void requestPromptAssist("style")}>
+                  <WandSparkles size={14} />
+                  风格增强
+                </button>
+              </div>
+              <div className="composer-meta">
+                <span className={referenceIssueCount > 0 ? "has-error" : referenceWarningCount > 0 ? "has-warning" : ""}>
+                  {referenceMetaLabel}
+                </span>
+                <span className={`composer-config-meta ${aspectRatioSupported ? "" : "has-error"}`}>
+                  {composerConfigSummary} · {resolvedRequestSize} · {params.outputFormat.toUpperCase()}
+                </span>
+                <label className="composer-auto-toggle" title="发送前自动优化提示词">
+                  <input
+                    type="checkbox"
+                    checked={isAutoPromptAnalysisEnabled}
+                    onChange={(event) => setIsAutoPromptAnalysisEnabled(event.target.checked)}
+                  />
+                  <span>发送前优化</span>
+                </label>
+                <span>{prompt.trim().length} 字</span>
+              </div>
+            </>
+          )}
           <input
             ref={fileInputRef}
             className="hidden-input"
@@ -5866,6 +6378,36 @@ export default function App() {
             onChange={onReferenceInput}
           />
         </form>
+        {agentModePendingPlan && (
+          <AgentModePlanModal
+            plan={agentModePendingPlan}
+            onCancel={() => {
+              setAgentModePendingPlan(null);
+              setAgentModeState({
+                status: "idle",
+                message: "已取消自动拆解，请继续修改需求。",
+              });
+            }}
+            onConfirm={() => enqueueAgentModeJobs(agentModePendingPlan.jobs, {
+              analysisResult: agentModePendingPlan,
+              clearComposer: true,
+              scenarioLabel: "自动拆解任务",
+            })}
+          />
+        )}
+        {agentModeBrochureDraft && (
+          <BrochurePlannerModal
+            project={agentModeBrochureDraft}
+            onCancel={() => {
+              setAgentModeBrochureDraft(null);
+              setAgentModeState({
+                status: "idle",
+                message: "已取消画册规划，请继续补充你的要求。",
+              });
+            }}
+            onGenerateBoards={() => submitBrochureStyleBoards(agentModeBrochureDraft)}
+          />
+        )}
       </main>
 
       <aside className={`settings-panel ${isSettingsOpen ? "open" : "closed"}`}>
@@ -7347,6 +7889,194 @@ function ConfirmDialog({
           <button type="button" className="subtle-button danger solid" onClick={onConfirm}>
             <Trash2 size={16} />
             {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AgentModeSwitch({
+  enabled,
+  status,
+  onToggle,
+}: {
+  enabled: boolean;
+  status: AgentModeStatus;
+  onToggle: () => void;
+}) {
+  return (
+    <div className={`agent-mode-switch ${enabled ? "is-on" : "is-off"} status-${status}`}>
+      <div className="agent-mode-switch-copy">
+        <strong>{AGENT_MODE_NAME}</strong>
+        <span>{enabled ? "理解任务并自动拆解" : "自动编排单图、多图与宣传画册"}</span>
+      </div>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={enabled}
+        className={`agent-mode-toggle ${enabled ? "is-on" : "is-off"}`}
+        onClick={onToggle}
+        title={enabled ? "关闭 Agent 模式 A" : "开启 Agent 模式 A"}
+      >
+        <span className="agent-mode-toggle-track">
+          <span className="agent-mode-toggle-thumb">
+            {enabled ? <Bot size={14} /> : <WandSparkles size={14} />}
+          </span>
+        </span>
+      </button>
+    </div>
+  );
+}
+
+function AgentModeStatusPanel({
+  state,
+  onClear,
+}: {
+  state: AgentModeState;
+  onClear: () => void;
+}) {
+  if (!state.message && state.status === "idle") return null;
+  const icon = state.status === "analyzing" || state.status === "executing"
+    ? <Loader2 size={16} className="spin" />
+    : state.status === "error"
+      ? <AlertCircle size={16} />
+      : state.status === "planned"
+        ? <Bot size={16} />
+        : <CheckCircle2 size={16} />;
+  return (
+    <div className={`agent-mode-status-panel ${state.status}`} role="status" aria-live="polite">
+      <div className="agent-mode-status-head">
+        <div className="agent-mode-status-mark">{icon}</div>
+        <div>
+          <strong>
+            {state.status === "analyzing"
+              ? "正在理解任务"
+              : state.status === "needs_confirmation"
+                ? "等待确认"
+                : state.status === "planned"
+                  ? "画册规划已准备好"
+                  : state.status === "executing"
+                    ? "任务已进入队列"
+                    : state.status === "error"
+                      ? "解析失败"
+                      : AGENT_MODE_NAME}
+          </strong>
+          <span>{state.message}</span>
+          {state.error && <small>{state.error}</small>}
+        </div>
+      </div>
+      {state.status !== "analyzing" && (
+        <button type="button" className="icon-button" title="清除 Agent 状态" onClick={onClear}>
+          <X size={15} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function AgentModePlanModal({
+  plan,
+  onCancel,
+  onConfirm,
+}: {
+  plan: AgentModeAnalysisResult;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="confirm-modal" role="dialog" aria-modal="true" aria-label="Agent 任务拆解">
+      <button className="confirm-backdrop" type="button" aria-label="关闭 Agent 任务拆解" onClick={onCancel} />
+      <div className="confirm-card agent-plan-modal">
+        <div className="agent-plan-modal-head">
+          <div>
+            <strong>{AGENT_MODE_NAME} 任务拆解</strong>
+            <p>{plan.reasoningSummary}</p>
+          </div>
+          <span className={`risk-badge ${plan.estimatedCostLevel === "high" ? "high" : plan.estimatedCostLevel === "medium" ? "medium" : "low"}`}>
+            {plan.estimatedCostLevel === "high" ? "高消耗" : plan.estimatedCostLevel === "medium" ? "中消耗" : "低消耗"}
+          </span>
+        </div>
+        <div className="agent-plan-modal-list">
+          {plan.jobs.map((job, index) => (
+            <article className="agent-plan-job-card" key={job.id || `${job.title}-${index}`}>
+              <div className="agent-plan-job-head">
+                <strong>{job.title}</strong>
+                <small>{job.count || 1} 张 · {job.aspectRatio || "自动比例"} · {job.resolution || "自动清晰度"}</small>
+              </div>
+              {job.objective && <span className="agent-plan-job-objective">{job.objective}</span>}
+              <p>{job.prompt}</p>
+            </article>
+          ))}
+        </div>
+        <div className="confirm-actions">
+          <button type="button" className="subtle-button" onClick={onCancel}>
+            返回编辑
+          </button>
+          <button type="button" className="primary-action compact" onClick={onConfirm}>
+            <ArrowRight size={15} />
+            确认并生成 {plan.jobs.reduce((sum, job) => sum + (job.count || 1), 0)} 张
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BrochurePlannerModal({
+  project,
+  onCancel,
+  onGenerateBoards,
+}: {
+  project: AgentModeBrochureProject;
+  onCancel: () => void;
+  onGenerateBoards: () => void;
+}) {
+  return (
+    <div className="confirm-modal" role="dialog" aria-modal="true" aria-label="宣传画册规划">
+      <button className="confirm-backdrop" type="button" aria-label="关闭宣传画册规划" onClick={onCancel} />
+      <div className="confirm-card brochure-plan-modal">
+        <div className="agent-plan-modal-head">
+          <div>
+            <strong>{project.title}</strong>
+            <p>{project.summary}</p>
+          </div>
+          <span className="brochure-plan-count">{project.pageCount} 页</span>
+        </div>
+        <div className="brochure-plan-meta">
+          <span>{project.companyName || "未指定公司名"}</span>
+          <span>{project.industry || "行业待细化"}</span>
+          <span>{project.purpose || "公司宣传"}</span>
+        </div>
+        <div className="brochure-plan-section">
+          <strong>页结构</strong>
+          <div className="brochure-outline-list">
+            {project.outline.map((page) => (
+              <div className="brochure-outline-item" key={`${page.pageNo}-${page.role}`}>
+                <span>#{page.pageNo}</span>
+                <div>
+                  <strong>{page.title}</strong>
+                  <small>{page.objective}</small>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="brochure-plan-section">
+          <strong>推荐模板方向</strong>
+          <div className="brochure-style-chip-row">
+            {project.styleDirections.map((direction) => (
+              <span key={direction}>{direction}</span>
+            ))}
+          </div>
+        </div>
+        <div className="confirm-actions">
+          <button type="button" className="subtle-button" onClick={onCancel}>
+            稍后再说
+          </button>
+          <button type="button" className="primary-action compact" onClick={onGenerateBoards}>
+            <WandSparkles size={15} />
+            生成整本模板板
           </button>
         </div>
       </div>

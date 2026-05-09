@@ -82,7 +82,7 @@ type AdminUser = {
 };
 
 type RequestLogStatus = "running" | "success" | "error";
-type RequestLogType = "image_generation" | "prompt_analysis";
+type RequestLogType = "image_generation" | "prompt_analysis" | "agent_analysis";
 
 type RequestLog = {
   requestId: string;
@@ -986,6 +986,693 @@ function normalizeAnalysisPayload(value: unknown, analysisModel: string) {
     analysisModel,
     source: "ai",
   };
+}
+
+type AgentModeIntentType = "single_image" | "multi_image_batch" | "brochure_project" | "page_refine" | "unknown";
+type AgentModeCostLevel = "low" | "medium" | "high";
+type AgentModeJobSpec = {
+  id: string;
+  title: string;
+  prompt: string;
+  objective?: string;
+  negativePrompt?: string;
+  aspectRatio?: string;
+  size?: string;
+  resolution?: "1K" | "2K" | "4K";
+  quality?: string;
+  count?: number;
+};
+type AgentModeBrochurePage = {
+  pageNo: number;
+  role: string;
+  title: string;
+  objective: string;
+};
+type AgentModeBrochureProject = {
+  title: string;
+  companyName?: string;
+  industry?: string;
+  purpose?: string;
+  pageCount: number;
+  summary: string;
+  outline: AgentModeBrochurePage[];
+  styleDirections: string[];
+  requestPrompt?: string;
+};
+type AgentModeAnalysisResult = {
+  intentType: AgentModeIntentType;
+  confidence: number;
+  reasoningSummary: string;
+  estimatedCostLevel: AgentModeCostLevel;
+  requiresConfirmation: boolean;
+  autoExecute: boolean;
+  jobs: AgentModeJobSpec[];
+  brochureProject?: AgentModeBrochureProject;
+  analysisModel?: string;
+  source?: "ai" | "local";
+};
+
+const CHINESE_DIGITS: Record<string, number> = {
+  零: 0,
+  一: 1,
+  二: 2,
+  两: 2,
+  三: 3,
+  四: 4,
+  五: 5,
+  六: 6,
+  七: 7,
+  八: 8,
+  九: 9,
+};
+
+function clampCount(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function parseNaturalCountToken(value = "") {
+  const normalized = value.trim();
+  if (!normalized) return undefined;
+  const arabic = normalized.match(/\d+/)?.[0];
+  if (arabic) return Number(arabic);
+  if (normalized === "十") return 10;
+  if (normalized.includes("十")) {
+    const [left, right] = normalized.split("十");
+    const leftValue = left ? (CHINESE_DIGITS[left] ?? 1) : 1;
+    const rightValue = right ? (CHINESE_DIGITS[right] ?? 0) : 0;
+    return leftValue * 10 + rightValue;
+  }
+  return CHINESE_DIGITS[normalized];
+}
+
+function normalizeAgentModeIntentType(value: unknown, fallback: AgentModeIntentType = "unknown"): AgentModeIntentType {
+  return value === "single_image"
+    || value === "multi_image_batch"
+    || value === "brochure_project"
+    || value === "page_refine"
+    || value === "unknown"
+    ? value
+    : fallback;
+}
+
+function normalizeAgentModeCostLevel(value: unknown, fallback: AgentModeCostLevel = "low"): AgentModeCostLevel {
+  return value === "low" || value === "medium" || value === "high" ? value : fallback;
+}
+
+function normalizeAgentModeJobSpec(
+  value: unknown,
+  fallback?: Partial<AgentModeJobSpec>,
+): AgentModeJobSpec {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const prompt = typeof record.prompt === "string" && record.prompt.trim()
+    ? record.prompt.trim()
+    : fallback?.prompt || "";
+  const id = typeof record.id === "string" && record.id.trim()
+    ? record.id.trim()
+    : fallback?.id || `job_${randomUUID().slice(0, 8)}`;
+  const count = typeof record.count === "number" && Number.isFinite(record.count)
+    ? clampCount(Math.round(record.count), 1, 8)
+    : clampCount(Math.round(fallback?.count || 1), 1, 8);
+  const resolution = record.resolution === "1K" || record.resolution === "2K" || record.resolution === "4K"
+    ? record.resolution
+    : fallback?.resolution;
+  return {
+    id,
+    title: typeof record.title === "string" && record.title.trim()
+      ? record.title.trim()
+      : fallback?.title || "图片任务",
+    prompt,
+    objective: typeof record.objective === "string" && record.objective.trim()
+      ? record.objective.trim()
+      : fallback?.objective,
+    negativePrompt: typeof record.negativePrompt === "string" && record.negativePrompt.trim()
+      ? record.negativePrompt.trim()
+      : fallback?.negativePrompt,
+    aspectRatio: typeof record.aspectRatio === "string" && record.aspectRatio.trim()
+      ? record.aspectRatio.trim()
+      : fallback?.aspectRatio,
+    size: typeof record.size === "string" && record.size.trim()
+      ? record.size.trim()
+      : fallback?.size,
+    resolution,
+    quality: typeof record.quality === "string" && record.quality.trim()
+      ? record.quality.trim()
+      : fallback?.quality,
+    count,
+  };
+}
+
+function normalizeAgentModeBrochurePage(
+  value: unknown,
+  index: number,
+): AgentModeBrochurePage {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const parsedPageNo = typeof record.pageNo === "number" && Number.isFinite(record.pageNo)
+    ? Math.max(1, Math.round(record.pageNo))
+    : index + 1;
+  return {
+    pageNo: parsedPageNo,
+    role: typeof record.role === "string" && record.role.trim() ? record.role.trim() : `page_${parsedPageNo}`,
+    title: typeof record.title === "string" && record.title.trim() ? record.title.trim() : `第 ${parsedPageNo} 页`,
+    objective: typeof record.objective === "string" && record.objective.trim()
+      ? record.objective.trim()
+      : "延续整本风格，完成本页的关键信息表达。",
+  };
+}
+
+function normalizeAgentModeBrochureProject(
+  value: unknown,
+  fallback?: Partial<AgentModeBrochureProject>,
+): AgentModeBrochureProject {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const fallbackOutline = Array.isArray(fallback?.outline) ? fallback.outline : [];
+  const outline = Array.isArray(record.outline)
+    ? record.outline
+      .map((item, index) => normalizeAgentModeBrochurePage(item, index))
+      .filter((item) => item.title)
+    : fallbackOutline;
+  const styleDirections = Array.isArray(record.styleDirections)
+    ? record.styleDirections
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter(Boolean)
+      .slice(0, 6)
+    : (fallback?.styleDirections || []);
+  const pageCount = typeof record.pageCount === "number" && Number.isFinite(record.pageCount)
+    ? clampCount(Math.round(record.pageCount), 2, 20)
+    : clampCount(Math.round(fallback?.pageCount || outline.length || 8), 2, 20);
+  return {
+    title: typeof record.title === "string" && record.title.trim()
+      ? record.title.trim()
+      : fallback?.title || "宣传画册方案",
+    companyName: typeof record.companyName === "string" && record.companyName.trim()
+      ? record.companyName.trim()
+      : fallback?.companyName,
+    industry: typeof record.industry === "string" && record.industry.trim()
+      ? record.industry.trim()
+      : fallback?.industry,
+    purpose: typeof record.purpose === "string" && record.purpose.trim()
+      ? record.purpose.trim()
+      : fallback?.purpose,
+    pageCount,
+    summary: typeof record.summary === "string" && record.summary.trim()
+      ? record.summary.trim()
+      : fallback?.summary || `共 ${pageCount} 页的宣传画册规划。`,
+    outline: outline.length > 0 ? outline : fallbackOutline,
+    styleDirections: styleDirections.length > 0 ? styleDirections : (fallback?.styleDirections || []),
+    requestPrompt: typeof record.requestPrompt === "string" && record.requestPrompt.trim()
+      ? record.requestPrompt.trim()
+      : fallback?.requestPrompt,
+  };
+}
+
+function normalizeAgentModeAnalysisPayload(
+  value: unknown,
+  fallback: AgentModeAnalysisResult,
+  analysisModel: string,
+): AgentModeAnalysisResult {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const intentType = normalizeAgentModeIntentType(record.intentType, fallback.intentType);
+  const jobs = Array.isArray(record.jobs)
+    ? record.jobs
+      .map((item, index) => normalizeAgentModeJobSpec(item, fallback.jobs[index] || fallback.jobs[0]))
+      .filter((job) => Boolean(job.prompt))
+    : fallback.jobs;
+  const brochureProjectSource = record.brochureProject ?? record.project;
+  const brochureProject = brochureProjectSource
+    ? normalizeAgentModeBrochureProject(brochureProjectSource, fallback.brochureProject)
+    : fallback.brochureProject;
+  return {
+    intentType,
+    confidence: typeof record.confidence === "number" && Number.isFinite(record.confidence)
+      ? Math.max(0, Math.min(1, record.confidence))
+      : fallback.confidence,
+    reasoningSummary: typeof record.reasoningSummary === "string" && record.reasoningSummary.trim()
+      ? record.reasoningSummary.trim()
+      : fallback.reasoningSummary,
+    estimatedCostLevel: normalizeAgentModeCostLevel(record.estimatedCostLevel, fallback.estimatedCostLevel),
+    requiresConfirmation: typeof record.requiresConfirmation === "boolean"
+      ? record.requiresConfirmation
+      : fallback.requiresConfirmation,
+    autoExecute: typeof record.autoExecute === "boolean" ? record.autoExecute : fallback.autoExecute,
+    jobs: jobs.length > 0 ? jobs : fallback.jobs,
+    brochureProject: intentType === "brochure_project" || brochureProject ? brochureProject : undefined,
+    analysisModel,
+    source: "ai",
+  };
+}
+
+function countAgentModeImages(jobs: AgentModeJobSpec[]) {
+  return jobs.reduce((sum, job) => sum + Math.max(1, Math.round(job.count || 1)), 0);
+}
+
+function recommendedAgentAspectRatio(prompt: string, fallback = "1:1") {
+  if (/(封面|海报|竖版|人物全身|彩页封面)/.test(prompt)) return "3:4";
+  if (/(画册|宣传册|内页|横版|跨页|目录|手册)/.test(prompt)) return "4:3";
+  if (/(横幅|banner|页眉|头图|展板|宽屏)/i.test(prompt)) return "16:9";
+  if (/(logo|图标|头像|方图|方形)/i.test(prompt)) return "1:1";
+  return fallback;
+}
+
+function recommendedAgentResolution(prompt: string) {
+  if (/(宣传册|画册|海报|展板|印刷|高清|高分辨率|封面)/.test(prompt)) return "2K" as const;
+  return "1K" as const;
+}
+
+function detectRequestedImageCount(prompt: string, fallback = 1) {
+  const patterns = [
+    /(?:做|生成|出|要|需要|想要|帮我做)\s*([0-9一二三四五六七八九十两]+)\s*张/,
+    /([0-9一二三四五六七八九十两]+)\s*张(?:图|图片|海报|方案|视觉|kv)?/,
+    /一共\s*([0-9一二三四五六七八九十两]+)\s*张/,
+  ];
+  for (const pattern of patterns) {
+    const matched = prompt.match(pattern)?.[1];
+    const count = parseNaturalCountToken(matched || "");
+    if (count && count > 0) return clampCount(count, 1, 8);
+  }
+  return fallback;
+}
+
+function detectRequestedPageCount(prompt: string, fallback = 8) {
+  const patterns = [
+    /([0-9一二三四五六七八九十两]+)\s*页/,
+    /共\s*([0-9一二三四五六七八九十两]+)\s*页/,
+    /包含\s*([0-9一二三四五六七八九十两]+)\s*页/,
+  ];
+  for (const pattern of patterns) {
+    const matched = prompt.match(pattern)?.[1];
+    const count = parseNaturalCountToken(matched || "");
+    if (count && count > 0) return clampCount(count, 2, 20);
+  }
+  return fallback;
+}
+
+function extractCompanyName(prompt: string) {
+  const patterns = [
+    /(?:为|给|帮|替)\s*[「“"]?([^，。,.；;\s]{2,24}?公司)[」”"]?/,
+    /([A-Za-z0-9\u4e00-\u9fa5]{2,24}?公司)/,
+  ];
+  for (const pattern of patterns) {
+    const matched = prompt.match(pattern)?.[1]?.trim();
+    if (!matched) continue;
+    if (/^(我|你|他|她|它|帮我|给我|做一个|做个|一个|一家|某家|某个|这个|那个)/.test(matched)) continue;
+    if (/^(制造业公司|科技公司|公司|企业公司)$/.test(matched)) continue;
+    if (/(一个|一家|某家|某个).{0,8}公司$/.test(matched)) continue;
+    return matched;
+  }
+  return "";
+}
+
+function detectIndustry(prompt: string) {
+  const keywordMap: Array<{ pattern: RegExp; value: string }> = [
+    { pattern: /(科技|SaaS|软件|AI|人工智能|云服务|数据)/i, value: "科技" },
+    { pattern: /(制造|工业|工厂|设备|机械|供应链)/, value: "制造" },
+    { pattern: /(医疗|医药|生物|健康|医院)/, value: "医疗" },
+    { pattern: /(教育|培训|学校|课程)/, value: "教育" },
+    { pattern: /(地产|建筑|空间|园区|楼盘)/, value: "地产" },
+    { pattern: /(金融|银行|证券|投资|保险)/, value: "金融" },
+    { pattern: /(美妆|护肤|时尚|服饰|珠宝)/, value: "消费品牌" },
+    { pattern: /(餐饮|食品|饮品|咖啡|酒水)/, value: "餐饮消费" },
+  ];
+  return keywordMap.find((item) => item.pattern.test(prompt))?.value || "企业品牌";
+}
+
+function detectBrochurePurpose(prompt: string) {
+  if (/(宣传画册|宣传册|公司介绍|企业介绍|企业宣传|品牌手册)/.test(prompt)) return "公司宣传";
+  if (/(招商|加盟|投资人)/.test(prompt)) return "招商宣传";
+  if (/(产品|目录|样本|产品册)/.test(prompt)) return "产品目录";
+  if (/(品牌|企业形象)/.test(prompt)) return "品牌介绍";
+  if (/(年度|年报|总结)/.test(prompt)) return "年度介绍";
+  return "公司宣传";
+}
+
+function brochureStyleDirectionsFor(industry: string, prompt: string) {
+  if (industry === "科技") {
+    return ["科技蓝信息栅格", "极简白底产品提案感", "深色发布会视觉", "未来感数据界面风"];
+  }
+  if (industry === "制造") {
+    return ["工业蓝目录感", "黑银设备质感", "白底参数样本册", "展会招商海报感"];
+  }
+  if (industry === "医疗") {
+    return ["洁净白蓝专业感", "高可信研究型版式", "温和品牌手册感", "器械产品目录感"];
+  }
+  if (/(高端|奢华|精品|时尚)/.test(prompt)) {
+    return ["高端杂志感", "黑金品牌提案感", "留白大片感", "Editorial 视觉陈列风"];
+  }
+  return ["科技蓝信息栅格", "高端杂志感", "制造业目录感", "招商海报感"];
+}
+
+function splitPromptIntoSegments(prompt: string) {
+  const prepared = prompt
+    .replace(/\r/g, "")
+    .replace(/(?=第\s*[0-9一二三四五六七八九十两]+\s*(?:张|幅|图|页))/g, "\n")
+    .replace(/(?=\d+\s*[\.、\)]\s*)/g, "\n");
+  return prepared
+    .split(/\n+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function stripSegmentMarker(value: string) {
+  return value
+    .replace(/^\s*(?:[-*•]\s*)/, "")
+    .replace(/^\s*\d+\s*[\.、\)]\s*/, "")
+    .replace(/^\s*第\s*[0-9一二三四五六七八九十两]+\s*(?:张|幅|图|页)\s*[:：]?\s*/, "")
+    .trim();
+}
+
+function extractBrochureTopics(prompt: string) {
+  const candidates: Array<{ pattern: RegExp; role: string; title: string; objective: string }> = [
+    { pattern: /(品牌导语|品牌介绍|前言|导语)/, role: "intro", title: "品牌导语", objective: "概括品牌定位与主张，建立阅读预期。" },
+    { pattern: /(公司介绍|企业简介|企业介绍|公司简介)/, role: "profile", title: "企业简介", objective: "说明公司背景、规模、发展历程与核心业务。" },
+    { pattern: /(核心优势|优势介绍|竞争优势)/, role: "advantages", title: "核心优势", objective: "突出技术、团队、供应链或服务的差异化优势。" },
+    { pattern: /(产品展示|产品介绍|产品矩阵|服务矩阵|服务介绍)/, role: "products", title: "产品/服务矩阵", objective: "梳理主要产品线、解决方案或服务模块。" },
+    { pattern: /(应用场景|解决方案|场景展示)/, role: "scenarios", title: "应用场景", objective: "展示产品或服务在真实业务场景中的价值。" },
+    { pattern: /(案例|客户案例|项目案例|成功案例)/, role: "cases", title: "案例展示", objective: "通过项目案例强化可信度与落地能力。" },
+    { pattern: /(团队|资质|荣誉|认证)/, role: "team", title: "团队与资质", objective: "呈现团队实力、认证资质、荣誉和合作资源。" },
+    { pattern: /(合作方式|联系我们|联系方式|合作流程)/, role: "cta", title: "合作方式", objective: "明确合作流程、联系入口与行动指引。" },
+  ];
+  return candidates
+    .map((item) => ({ ...item, index: prompt.search(item.pattern) }))
+    .filter((item) => item.index >= 0)
+    .sort((a, b) => a.index - b.index)
+    .map(({ role, title, objective }) => ({ role, title, objective }));
+}
+
+function buildLocalBrochureProject(prompt: string): AgentModeBrochureProject {
+  const pageCount = detectRequestedPageCount(prompt, 8);
+  const companyName = extractCompanyName(prompt);
+  const industry = detectIndustry(prompt);
+  const purpose = detectBrochurePurpose(prompt);
+  const middleTemplates: Array<{ role: string; title: string; objective: string }> = [
+    { role: "intro", title: "品牌导语", objective: "概括品牌定位与主张，建立阅读预期。" },
+    { role: "profile", title: "企业简介", objective: "说明公司背景、规模、发展历程与核心业务。" },
+    { role: "advantages", title: "核心优势", objective: "突出技术、团队、供应链或服务的差异化优势。" },
+    { role: "products", title: "产品/服务矩阵", objective: "梳理主要产品线、解决方案或服务模块。" },
+    { role: "scenarios", title: "应用场景", objective: "展示产品或服务在真实业务场景中的价值。" },
+    { role: "cases", title: "案例展示", objective: "通过项目案例强化可信度与落地能力。" },
+    { role: "team", title: "团队与资质", objective: "呈现团队实力、认证资质、荣誉和合作资源。" },
+    { role: "cta", title: "合作方式", objective: "明确合作流程、联系入口与行动指引。" },
+  ];
+  const detectedTopics = extractBrochureTopics(prompt);
+  const mergedTemplates = [
+    ...detectedTopics,
+    ...middleTemplates.filter((template) => !detectedTopics.some((item) => item.role === template.role)),
+  ];
+  const outline: AgentModeBrochurePage[] = [{
+    pageNo: 1,
+    role: "cover",
+    title: "封面",
+    objective: "建立品牌第一印象，突出公司名、主视觉与宣传主题。",
+  }];
+  const middleCount = Math.max(0, pageCount - 2);
+  for (let index = 0; index < middleCount; index += 1) {
+    const template = mergedTemplates[index % mergedTemplates.length];
+    outline.push({
+      pageNo: index + 2,
+      role: template.role,
+      title: template.title,
+      objective: template.objective,
+    });
+  }
+  if (pageCount > 1) {
+    outline.push({
+      pageNo: pageCount,
+      role: "back_cover",
+      title: "封底",
+      objective: "收束品牌形象，保留联系方式或行动号召。",
+    });
+  }
+  const titleBase = companyName || `${industry}企业`;
+  const title = `${titleBase}${purpose === "产品目录" ? "产品画册" : "宣传画册"}`;
+  return {
+    title,
+    companyName: companyName || undefined,
+    industry,
+    purpose,
+    pageCount,
+    summary: `识别为 ${pageCount} 页的${purpose}画册需求，建议先生成整本模板板，再逐页细化。`,
+    outline,
+    styleDirections: brochureStyleDirectionsFor(industry, prompt),
+    requestPrompt: prompt,
+  };
+}
+
+function buildLocalAgentModeAnalysis(body: ProxyBody): AgentModeAnalysisResult {
+  const prompt = getString(body, "prompt");
+  const aspectRatio = getString(body, "aspectRatio") || "1:1";
+  const size = getString(body, "size") || undefined;
+  const quality = getString(body, "quality") || "auto";
+  const negativePrompt = getString(body, "negativePrompt") || undefined;
+  const pageRefineMatch = prompt.match(/第\s*([0-9一二三四五六七八九十两]+)\s*页.*(?:修改|改成|重做|调整|优化|替换|单独再改)/);
+  const brochureKeywordScore = [
+    /(画册|宣传册|宣传画册|彩页|brochure)/i.test(prompt),
+    /(封底|内页|页结构|页数|整本|版式模板)/.test(prompt),
+    /第\s*[0-9一二三四五六七八九十两]+\s*页/.test(prompt),
+  ].filter(Boolean).length;
+  if (pageRefineMatch && brochureKeywordScore > 0) {
+    const pageNo = parseNaturalCountToken(pageRefineMatch[1]) || 1;
+    return {
+      intentType: "page_refine",
+      confidence: 0.86,
+      reasoningSummary: `识别为宣传画册的单页调整需求，将按第 ${pageNo} 页单独重做。`,
+      estimatedCostLevel: "low",
+      requiresConfirmation: false,
+      autoExecute: true,
+      jobs: [{
+        id: `page-refine-${pageNo}`,
+        title: `第 ${pageNo} 页精修`,
+        prompt: `为宣传画册单独重做第 ${pageNo} 页，保持整本视觉体系统一。用户要求：${prompt}`,
+        objective: `优化第 ${pageNo} 页的版式、主视觉和信息层级。`,
+        aspectRatio: "4:3",
+        size,
+        resolution: "2K",
+        quality,
+        negativePrompt,
+        count: 1,
+      }],
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+  if (brochureKeywordScore >= 2) {
+    return {
+      intentType: "brochure_project",
+      confidence: 0.94,
+      reasoningSummary: "识别为公司宣传画册任务，建议先生成整本模板板，再进入逐页细化。",
+      estimatedCostLevel: "medium",
+      requiresConfirmation: true,
+      autoExecute: false,
+      jobs: [],
+      brochureProject: buildLocalBrochureProject(prompt),
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+
+  const segments = splitPromptIntoSegments(prompt);
+  const explicitImageSegments = segments
+    .filter((segment) => /^([-*•]|\d+\s*[\.、\)]|第\s*[0-9一二三四五六七八九十两]+\s*(?:张|幅|图))/.test(segment))
+    .map(stripSegmentMarker)
+    .filter(Boolean);
+  if (explicitImageSegments.length >= 2) {
+    const jobs = explicitImageSegments.map((segment, index) => ({
+      id: `multi-${index + 1}`,
+      title: `第 ${index + 1} 张`,
+      prompt: segment,
+      objective: "生成一张与其他任务明显区分的独立图片。",
+      aspectRatio: recommendedAgentAspectRatio(segment, aspectRatio),
+      size,
+      resolution: recommendedAgentResolution(segment),
+      quality,
+      negativePrompt,
+      count: 1,
+    }));
+    return {
+      intentType: "multi_image_batch",
+      confidence: 0.92,
+      reasoningSummary: `识别到 ${jobs.length} 条独立图片需求，已按每张图分别拆解。`,
+      estimatedCostLevel: countAgentModeImages(jobs) >= 5 ? "high" : "medium",
+      requiresConfirmation: true,
+      autoExecute: false,
+      jobs,
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+
+  const requestedCount = detectRequestedImageCount(prompt, 1);
+  if (requestedCount > 1) {
+    const jobs: AgentModeJobSpec[] = [{
+      id: "multi-count-1",
+      title: requestedCount > 1 ? `同主题多图 · ${requestedCount} 张` : "图片任务",
+      prompt,
+      objective: "按同一主题生成多张候选图，可后续继续细分每张图的差异要求。",
+      aspectRatio: recommendedAgentAspectRatio(prompt, aspectRatio),
+      size,
+      resolution: recommendedAgentResolution(prompt),
+      quality,
+      negativePrompt,
+      count: requestedCount,
+    }];
+    return {
+      intentType: "multi_image_batch",
+      confidence: 0.8,
+      reasoningSummary: `识别到需要 ${requestedCount} 张图片，但未拆出逐张描述，先按同主题多图方案处理。`,
+      estimatedCostLevel: requestedCount >= 5 ? "high" : "medium",
+      requiresConfirmation: true,
+      autoExecute: false,
+      jobs,
+      analysisModel: "local-agent-heuristic",
+      source: "local",
+    };
+  }
+
+  return {
+    intentType: "single_image",
+    confidence: 0.96,
+    reasoningSummary: "识别为单张图片需求，已准备直接进入生成。",
+    estimatedCostLevel: "low",
+    requiresConfirmation: false,
+    autoExecute: true,
+    jobs: [{
+      id: "single-1",
+      title: "主图生成",
+      prompt,
+      objective: "根据提示词直接生成单张主图。",
+      aspectRatio: recommendedAgentAspectRatio(prompt, aspectRatio),
+      size,
+      resolution: recommendedAgentResolution(prompt),
+      quality,
+      negativePrompt,
+      count: 1,
+    }],
+    analysisModel: "local-agent-heuristic",
+    source: "local",
+  };
+}
+
+function chatCompletionMessageText(value: unknown) {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const choices = Array.isArray(record.choices) ? record.choices as Array<Record<string, unknown>> : [];
+  const message = choices[0]?.message;
+  if (!message || typeof message !== "object") return "";
+  const content = (message as Record<string, unknown>).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (!item || typeof item !== "object") return "";
+        return typeof (item as Record<string, unknown>).text === "string"
+          ? (item as Record<string, unknown>).text as string
+          : "";
+      })
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
+async function analyzeAgentModeWithGpt(
+  baseUrl: string,
+  apiKey: string,
+  body: ProxyBody,
+  requestId?: string,
+) {
+  const analysisModel = getString(body, "analysisModel");
+  const prompt = getString(body, "prompt");
+  if (!analysisModel) throw new Error("分析模型不能为空");
+  if (!prompt) throw new Error("提示词不能为空");
+  if (!apiKey) throw new Error("API Key 不能为空");
+
+  const localFallback = buildLocalAgentModeAnalysis(body);
+  const context = {
+    prompt,
+    protocol: getString(body, "protocol"),
+    imageModel: getString(body, "imageModel"),
+    aspectRatio: getString(body, "aspectRatio"),
+    size: getString(body, "size"),
+    resolution: getString(body, "resolution"),
+    quality: getString(body, "quality"),
+    outputFormat: getString(body, "outputFormat"),
+    count: getNumber(body.count),
+    referenceCount: getNumber(body.referenceCount) || 0,
+  };
+  const systemPrompt = [
+    "你是一个图片生成 Agent 的任务拆解器。",
+    "你要识别用户当前输入属于 single_image、multi_image_batch、brochure_project 或 page_refine 哪一种。",
+    "如果是多图任务，要尽量拆成逐张独立 job；如果只是说明总张数但没有逐张差异，也可以返回 1 个 job 并把 count 设为总数。",
+    "如果是宣传画册任务，不要直接输出 jobs，而是返回 brochureProject，包含 title, companyName, industry, purpose, pageCount, summary, outline, styleDirections, requestPrompt。",
+    "outline 每项包含 pageNo, role, title, objective。styleDirections 返回 3 到 6 个方向。",
+    "如果是 page_refine，需要输出 1 个 job，说明是某一页单独重做。",
+    "只返回 JSON，不要使用 Markdown。",
+    "JSON 顶层字段必须包含 intentType, confidence, reasoningSummary, estimatedCostLevel, requiresConfirmation, autoExecute, jobs, brochureProject。",
+    "estimatedCostLevel 只能是 low、medium、high。confidence 范围 0 到 1。",
+    "每个 job 可包含 id, title, prompt, objective, negativePrompt, aspectRatio, size, resolution, quality, count。",
+  ].join("\n");
+
+  const upstreamPayload = {
+    model: analysisModel,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify(context, null, 2) },
+    ],
+    temperature: 0.1,
+    response_format: { type: "json_object" },
+  };
+  if (requestId) {
+    updateRequestLog(requestId, {
+      upstreamPayloadKeys: Object.keys(upstreamPayload),
+      upstreamRequest: sanitizeForLog(upstreamPayload),
+    });
+  }
+
+  const response = await fetchWithTimeout(endpoint(baseUrl, "/v1/chat/completions"), {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(upstreamPayload),
+  }, 60_000);
+  const bodyText = await response.text();
+  if (!response.ok) {
+    const detail = detailFromUpstream(response.status, bodyText);
+    if (requestId) {
+      updateRequestLog(requestId, {
+        responseBody: sanitizeForLog({
+          ok: false,
+          status: response.status,
+          detail,
+          rawContent: truncateText(bodyText, 4000),
+        }),
+      });
+    }
+    throw detail;
+  }
+
+  const parsed = parseMaybeJson(bodyText);
+  const content = chatCompletionMessageText(parsed);
+  if (!content) {
+    throw new Error("分析模型没有返回有效内容");
+  }
+  const analysis = parseMaybeJson(extractJsonObject(content));
+  if (!analysis || typeof analysis !== "object") {
+    throw new Error("Agent 分析结果不是有效 JSON");
+  }
+  const normalized = normalizeAgentModeAnalysisPayload(analysis, localFallback, analysisModel);
+  if (requestId) {
+    updateRequestLog(requestId, {
+      responseBody: sanitizeForLog({
+        ok: true,
+        status: response.status,
+        rawContent: truncateText(content, 4000),
+        analysis: normalized,
+      }),
+    });
+  }
+  return normalized;
 }
 
 type AnalyzeStreamCallbacks = {
@@ -2010,6 +2697,133 @@ function imageProxyPlugin(): PluginOption {
           } else {
             sendJson(res, status, { ok: false, requestId, detail });
           }
+        }
+      });
+
+      server.middlewares.use("/api/agent/analyze", async (req, res) => {
+        if (req.method !== "POST") {
+          sendJson(res, 405, { ok: false, error: "Method not allowed" });
+          return;
+        }
+        const requestId = randomUUID();
+        const startedAt = Date.now();
+        let logCreated = false;
+
+        try {
+          const body = await readJsonBody(req);
+          const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl") || ALLOWED_API_BASE_URLS[0]);
+          const apiKey = getString(body, "apiKey");
+          const protocol = getProtocol(body.protocol);
+          const clientId = getString(body, "clientId") || "anonymous";
+          const analysisModel = getString(body, "analysisModel");
+          const prompt = getString(body, "prompt");
+
+          if (!prompt) {
+            sendJson(res, 400, {
+              ok: false,
+              requestId,
+              detail: { status: 400, error: "提示词不能为空" },
+            });
+            return;
+          }
+
+          createRequestLog({
+            requestId,
+            requestType: "agent_analysis",
+            clientId: truncateText(clientId, 120),
+            clientUserAgent: truncateText(req.headers["user-agent"] || "", 500),
+            clientIpHash: hashClientIp(req),
+            protocol,
+            apiBaseUrl: baseUrl.replace(/\/+$/, ""),
+            ...apiKeyLogMeta(apiKey),
+            endpoint: "/api/agent/analyze",
+            model: truncateText(analysisModel || "local-agent-heuristic", 240),
+            prompt: truncateText(prompt, 4000),
+            negativePrompt: getString(body, "negativePrompt") ? truncateText(getString(body, "negativePrompt"), 2400) : undefined,
+            aspectRatio: getString(body, "aspectRatio") || undefined,
+            size: getString(body, "size") || undefined,
+            resolution: getString(body, "resolution") || undefined,
+            quality: getString(body, "quality") || undefined,
+            outputFormat: getString(body, "outputFormat") || undefined,
+            referenceCount: getNumber(body.referenceCount) || 0,
+            requestParams: sanitizeForLog({
+              ...body,
+              baseUrl,
+              apiKey: undefined,
+              credential: apiKeyLogMeta(apiKey),
+            }),
+            status: "running",
+            createdAt: startedAt,
+            startedAt,
+            imageSaved: false,
+          });
+          logCreated = true;
+
+          const localAnalysis = buildLocalAgentModeAnalysis(body);
+          let analysis = localAnalysis;
+          let fallbackReason = "";
+
+          if (analysisModel && apiKey) {
+            try {
+              analysis = await analyzeAgentModeWithGpt(baseUrl, apiKey, body, requestId);
+            } catch (error) {
+              fallbackReason = truncateText(
+                error instanceof Error ? error.message : JSON.stringify(sanitizeForLog(error)),
+                1000,
+              );
+              analysis = {
+                ...localAnalysis,
+                reasoningSummary: `${localAnalysis.reasoningSummary} AI 分析暂不可用，已回退到本地规则拆解。`,
+              };
+            }
+          }
+
+          const finishedAt = Date.now();
+          if (logCreated) {
+            updateRequestLog(requestId, {
+              status: "success",
+              httpStatus: 200,
+              finishedAt,
+              durationMs: finishedAt - startedAt,
+              responseBody: sanitizeForLog({
+                ok: true,
+                requestId,
+                usedModel: analysisModel || "local-agent-heuristic",
+                fallbackReason: fallbackReason || undefined,
+                analysis,
+              }),
+            });
+          }
+
+          sendJson(res, 200, {
+            ok: true,
+            requestId,
+            analysis,
+          });
+        } catch (error) {
+          const status = isAllowedApiBaseUrlError(error) ? 400 : httpStatusFromDetail(error) || 500;
+          if (logCreated) {
+            const summary = safeErrorSummary(error);
+            const finishedAt = Date.now();
+            updateRequestLog(requestId, {
+              status: "error",
+              httpStatus: status,
+              errorMessage: summary.message,
+              errorType: summary.type || "agent_analysis_error",
+              errorCode: summary.code,
+              errorRaw: summary.raw,
+              responseBody: sanitizeForLog({ ok: false, requestId, status, detail: error }),
+              finishedAt,
+              durationMs: finishedAt - startedAt,
+            });
+          }
+          sendJson(res, status, {
+            ok: false,
+            requestId,
+            detail: error && typeof error === "object" && "error" in (error as Record<string, unknown>)
+              ? error
+              : { status, error: error instanceof Error ? error.message : String(error) },
+          });
         }
       });
 
