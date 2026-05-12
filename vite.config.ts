@@ -260,6 +260,10 @@ type SquareStore = {
 const API_TIMEOUT_MS = 300_000;
 const MAX_REQUEST_BYTES = 60 * 1024 * 1024;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
+const GPT_IMAGE_2_MODEL = "gpt-image-2";
+const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
+const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
+const GEMINI_NATIVE_API_PREFIX = "/v1beta";
 const ALLOWED_API_BASE_URLS = ["https://www.taijiai.online/", "https://bobdong.cn/"];
 const SESSION_COOKIE = "image_studio_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
@@ -324,10 +328,10 @@ const FRONTEND_BUILD_INFO = {
 const adminSessions = new Map<string, { username: string; expiresAt: number }>();
 
 const DEFAULT_MODELS: Record<ImageProtocol, string[]> = {
-  "custom-openai": ["gpt-image-2", "gpt-5.4-image-2"],
-  "openai-images": ["gpt-image-2", "gpt-5.4-image-2"],
+  "custom-openai": [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
+  "openai-images": [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
   "openai-responses": ["gpt-4.1", "gpt-4.1-mini"],
-  "gemini-native": ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
+  "gemini-native": [GEMINI_3_PRO_IMAGE_MODEL, "gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
   "gemini-openai": ["gemini-2.5-flash-image"],
   "google-imagen": ["imagen-4.0-generate-001", "imagen-4.0-ultra-generate-001", "imagen-3.0-generate-002"],
   "stability-core": ["stable-image-core", "stable-image-ultra"],
@@ -761,7 +765,7 @@ function updateRequestLog(requestId: string, patch: Partial<RequestLog>) {
 
 function generationEndpointLabel(protocol: ImageProtocol, model = "", referenceCount = 0) {
   if (protocol === "openai-responses") return "/v1/responses";
-  if (protocol === "gemini-native") return `/models/${modelName(model)}:generateContent`;
+  if (protocol === "gemini-native") return `${GEMINI_NATIVE_API_PREFIX}/models/${modelName(model)}:generateContent`;
   if (protocol === "google-imagen") return `/models/${modelName(model)}:predict`;
   if (protocol === "stability-core") {
     return String(model).includes("ultra")
@@ -883,9 +887,15 @@ function squareRankScore(item: SquareItem, tab: SquareFeedTab, now = Date.now())
   return Math.round((recencyScore * 0.45 + likeScore * 0.35 + qualityScore * 0.15 + trustScore * 0.05 + manualBoost) * 100) / 100;
 }
 
+let squareRankScoreCache = new WeakMap<SquareItem, number>();
+
 function sortSquareItems(items: SquareItem[], tab: SquareFeedTab) {
   const now = Date.now();
-  if (tab === "latest") return [...items].sort((a, b) => b.createdAt - a.createdAt);
+  squareRankScoreCache = new WeakMap();
+  if (tab === "latest") {
+    for (const item of items) squareRankScoreCache.set(item, squareRankScore(item, tab, now));
+    return [...items].sort((a, b) => b.createdAt - a.createdAt);
+  }
   const periodMs = tab === "top_day"
     ? 24 * 60 * 60 * 1000
     : tab === "top_week"
@@ -896,8 +906,9 @@ function sortSquareItems(items: SquareItem[], tab: SquareFeedTab) {
   const scoped = periodMs > 0
     ? items.filter((item) => item.createdAt >= now - periodMs)
     : items;
+  for (const item of scoped) squareRankScoreCache.set(item, squareRankScore(item, tab, now));
   return [...scoped].sort((a, b) => {
-    const scoreDiff = squareRankScore(b, tab, now) - squareRankScore(a, tab, now);
+    const scoreDiff = (squareRankScoreCache.get(b) ?? 0) - (squareRankScoreCache.get(a) ?? 0);
     return scoreDiff || b.createdAt - a.createdAt;
   });
 }
@@ -906,12 +917,12 @@ function isLikedBy(store: SquareStore, apiKeyHash: string, itemId: string) {
   return Boolean(store.likes.find((like) => like.apiKeyHash === apiKeyHash && like.itemId === itemId && like.liked));
 }
 
-function squareFeedItem(item: SquareItem, store: SquareStore, tab: SquareFeedTab, viewerApiKeyHash = "") {
+function squareFeedItem(item: SquareItem, store: SquareStore, tab: SquareFeedTab, viewerApiKeyHash = "", cachedRankScore?: number) {
   return {
     id: item.id,
     imageId: item.imageId,
     requestId: item.requestId,
-    thumbnailDataUrl: item.thumbnailDataUrl,
+    thumbnailUrl: `/api/square/image/${item.id}`,
     prompt: item.prompt,
     caption: item.caption,
     model: item.model,
@@ -926,7 +937,7 @@ function squareFeedItem(item: SquareItem, store: SquareStore, tab: SquareFeedTab
     likeCount: item.likeCount || 0,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
-    rankScore: squareRankScore(item, tab),
+    rankScore: cachedRankScore ?? squareRankScore(item, tab),
     likedByRequester: viewerApiKeyHash ? isLikedBy(store, viewerApiKeyHash, item.id) : false,
   };
 }
@@ -1218,7 +1229,7 @@ function scaleSize(size: string, resolution = "1K") {
 }
 
 function imageSizeForProtocol(request: GenerateRequest, protocol: ImageProtocol) {
-  if (isImage2Model(request.model) && request.aspectRatio) {
+  if (isGptImage2Model(request.model) && request.aspectRatio) {
     return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
   }
   return request.aspectRatio
@@ -1226,13 +1237,17 @@ function imageSizeForProtocol(request: GenerateRequest, protocol: ImageProtocol)
     : request.size || "auto";
 }
 
-function isImage2Model(model = "") {
+function isGptImage2Model(model = "") {
   const normalized = model.toLowerCase();
-  return normalized === "gpt-image-2" || normalized === "gpt-5.4-image-2" || normalized.includes("image-2");
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_FAMILY_MODEL || normalized.includes("image-2");
+}
+
+function isGemini3ProImageModel(model = "") {
+  return modelName(model).toLowerCase() === GEMINI_3_PRO_IMAGE_MODEL;
 }
 
 function imageGenerationSize(request: GenerateRequest) {
-  if (isImage2Model(request.model) && request.aspectRatio) {
+  if (isGptImage2Model(request.model) && request.aspectRatio) {
     return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
   }
   return request.size || request.aspectRatio || "auto";
@@ -2502,8 +2517,8 @@ async function generateOpenAiCompatible(baseUrl: string, apiKey: string, request
   if (requestSize && requestSize !== "auto") payload.size = requestSize;
   if (request.quality && request.quality !== "auto") payload.quality = request.quality;
   if (outputFormat && outputFormat !== "png") payload.output_format = outputFormat;
-  if (request.aspectRatio && protocol === "custom-openai" && !isImage2Model(request.model)) payload.aspect_ratio = request.aspectRatio;
-  if (protocol === "custom-openai" && !isImage2Model(request.model) && request.resolution && request.resolution !== "1K") {
+  if (request.aspectRatio && protocol === "custom-openai" && !isGptImage2Model(request.model)) payload.aspect_ratio = request.aspectRatio;
+  if (protocol === "custom-openai" && !isGptImage2Model(request.model) && request.resolution && request.resolution !== "1K") {
     payload.resolution = request.resolution;
   }
   if (request.seed) payload.seed = Number.isFinite(Number(request.seed)) ? Number(request.seed) : request.seed;
@@ -2626,25 +2641,30 @@ async function generateGeminiNative(baseUrl: string, apiKey: string, request: Ge
     { text: fullPrompt(request) },
     ...references.map(dataUrlToGeminiPart),
   ];
+  const imageConfig: Record<string, unknown> = {
+    aspectRatio: request.aspectRatio || "1:1",
+  };
+  if (isGemini3ProImageModel(request.model)) {
+    imageConfig.imageSize = normalizeResolution(request.resolution);
+  }
   const upstreamPayload = {
     contents: [{ role: "user", parts }],
     generationConfig: {
       responseModalities: ["TEXT", "IMAGE"],
-      imageConfig: {
-        aspectRatio: request.aspectRatio || "1:1",
-      },
+      imageConfig,
     },
   };
   if (requestId) {
     updateRequestLog(requestId, {
-      endpoint: `/models/${modelName(request.model)}:generateContent`,
+      endpoint: `${GEMINI_NATIVE_API_PREFIX}/models/${modelName(request.model)}:generateContent`,
       upstreamPayloadKeys: Object.keys(upstreamPayload),
       upstreamReferenceCount: references.length,
       upstreamReferenceMode: references.length ? "gemini:parts:inline_data" : "none",
+      upstreamSize: typeof imageConfig.imageSize === "string" ? imageConfig.imageSize : undefined,
       upstreamRequest: sanitizeForLog(upstreamPayload),
     });
   }
-  const response = await fetchWithTimeout(endpoint(baseUrl, `/models/${modelName(request.model)}:generateContent`), {
+  const response = await fetchWithTimeout(endpoint(baseUrl, `${GEMINI_NATIVE_API_PREFIX}/models/${modelName(request.model)}:generateContent`), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -2753,7 +2773,8 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
   }
 
   if (protocol === "gemini-native" || protocol === "google-imagen") {
-    const response = await fetchWithTimeout(endpoint(baseUrl, "/models"), {
+    const path = protocol === "gemini-native" ? `${GEMINI_NATIVE_API_PREFIX}/models` : "/models";
+    const response = await fetchWithTimeout(endpoint(baseUrl, path), {
       headers: { "x-goog-api-key": apiKey },
     });
     const text = await response.text();
@@ -2763,7 +2784,7 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
     if (protocol === "google-imagen") {
       models = models.filter((model) => model.toLowerCase().includes("imagen"));
     }
-    return { models: models.length > 0 ? models : DEFAULT_MODELS[protocol], raw: payload };
+    return { models: [...new Set([...DEFAULT_MODELS[protocol], ...models])], raw: payload };
   }
 
   const path = protocol === "gemini-openai" ? "/models" : "/v1/models";
@@ -2774,7 +2795,7 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
   if (!response.ok) throw detailFromUpstream(response.status, text);
   const payload = parseMaybeJson(text);
   const models = extractModelIds(payload, "data");
-  return { models: models.length > 0 ? models : DEFAULT_MODELS[protocol], raw: payload };
+  return { models: [...new Set([...DEFAULT_MODELS[protocol], ...models])], raw: payload };
 }
 
 async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
@@ -2786,7 +2807,7 @@ async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
   const tab = normalizeSquareFeedTab(url.searchParams.get("tab"));
   const limit = Math.max(1, Math.min(SQUARE_MAX_FEED_LIMIT, Number(url.searchParams.get("limit")) || SQUARE_MAX_FEED_LIMIT));
   const offset = squareCursorOffset(url.searchParams.get("cursor"));
-  const apiKey = (url.searchParams.get("apiKey") || String(req.headers["x-imagehub-api-key"] || "")).trim();
+  const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
   const viewerHash = apiKey ? hashApiKey(apiKey) : "";
   const store = readSquareStore();
   const sorted = sortSquareItems(squareActiveItems(store), tab);
@@ -2795,7 +2816,7 @@ async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
   sendJson(res, 200, {
     ok: true,
     tab,
-    items: items.map((item) => squareFeedItem(item, store, tab, viewerHash)),
+    items: items.map((item) => squareFeedItem(item, store, tab, viewerHash, squareRankScoreCache.get(item))),
     nextCursor: nextOffset < sorted.length ? squareNextCursor(nextOffset) : "",
     hasMore: nextOffset < sorted.length,
   });
@@ -2806,8 +2827,7 @@ async function handleSquareQuota(req: IncomingMessage, res: ServerResponse) {
     sendJson(res, 405, { ok: false, error: "Method not allowed" });
     return;
   }
-  const url = new URL(req.url || "/", "http://localhost");
-  const apiKey = (url.searchParams.get("apiKey") || String(req.headers["x-imagehub-api-key"] || "")).trim();
+  const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
   if (!apiKey) {
     sendJson(res, 401, { ok: false, error: "推荐和点赞需要先配置 API Key" });
     return;
@@ -3356,6 +3376,23 @@ function imageProxyPlugin(): PluginOption {
           return;
         }
         res.end(record.bytes);
+      });
+
+      server.middlewares.use("/api/square/image/", (req, res) => {
+        const itemId = decodeURIComponent((req.url || "/").split("?")[0]?.replace(/^\/+/, "") || "");
+        if (!itemId) { sendJson(res, 400, { ok: false, error: "missing item id" }); return; }
+        const store = readSquareStore();
+        const item = store.items.find((candidate) => candidate.id === itemId);
+        if (!item || !item.thumbnailDataUrl) { sendJson(res, 404, { ok: false, error: "not found" }); return; }
+        const match = item.thumbnailDataUrl.match(/^data:(image\/[a-zA-Z+.-]+);base64,(.*)$/);
+        if (!match) { sendJson(res, 500, { ok: false, error: "invalid data" }); return; }
+        const bytes = Buffer.from(match[2], "base64");
+        res.statusCode = 200;
+        res.setHeader("Content-Type", match[1]);
+        res.setHeader("Content-Length", String(bytes.length));
+        res.setHeader("Cache-Control", "public, max-age=86400, immutable");
+        if (req.method === "HEAD") { res.end(); return; }
+        res.end(bytes);
       });
 
       server.middlewares.use("/api/square/feed", (req, res) => {

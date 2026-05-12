@@ -439,7 +439,7 @@ type SquareFeedItem = {
   id: string;
   imageId: string;
   requestId?: string;
-  thumbnailDataUrl: string;
+  thumbnailUrl: string;
   prompt: string;
   caption: string;
   model: string;
@@ -655,6 +655,10 @@ const ALLOWED_API_ENDPOINTS = [
 const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
 const DEFAULT_PROTOCOL: ImageProtocol = "custom-openai";
 const DEFAULT_IMAGE_RESOLUTION: ImageResolution = "1K";
+const GPT_IMAGE_2_MODEL = "gpt-image-2";
+const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
+const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
+const PRIMARY_IMAGE_MODELS = [GPT_IMAGE_2_MODEL, GEMINI_3_PRO_IMAGE_MODEL] as const;
 const SUPPORTED_REFERENCE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 const ASPECT_RATIOS = [
@@ -677,6 +681,7 @@ const ASPECT_RATIOS = [
 
 const ALL_ASPECT_RATIOS = ASPECT_RATIOS.map((ratio) => ratio.value);
 const GPT_IMAGE_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2"] as const;
+const GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS = ["1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"] as const;
 
 const IMAGEN_ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
 const STABILITY_ASPECT_RATIOS = ["16:9", "1:1", "21:9", "2:3", "3:2", "4:5", "5:4", "9:16", "9:21"];
@@ -698,6 +703,19 @@ const SIZE_BY_RATIO: Record<string, string> = {
   "1:4": "512x2048",
   "8:1": "2048x256",
   "1:8": "256x2048",
+};
+
+const GEMINI_3_PRO_SIZE_BY_RATIO: Record<string, string> = {
+  "1:1": "1024x1024",
+  "2:3": "832x1248",
+  "3:2": "1248x832",
+  "3:4": "896x1200",
+  "4:3": "1200x896",
+  "4:5": "864x1088",
+  "5:4": "1088x864",
+  "9:16": "768x1344",
+  "16:9": "1344x768",
+  "21:9": "1536x672",
 };
 
 const IMAGE_RESOLUTIONS: Array<{ value: ImageResolution; label: string; hint: string; multiplier: number }> = [
@@ -725,7 +743,7 @@ const PROTOCOLS: Array<{
     shortLabel: "兼容协议",
     description: "适合第三方中转或自建 OpenAI 风格图片接口",
     defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gpt-image-1", "gpt-image-2"],
+    defaultModels: [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
     supportedAspectRatios: ALL_ASPECT_RATIOS,
     supportsReferenceImages: true,
     supportsNegativePrompt: true,
@@ -738,7 +756,7 @@ const PROTOCOLS: Array<{
     shortLabel: "OpenAI",
     description: "OpenAI 风格 Images API，宽高比会转换为 size 参数",
     defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gpt-image-1"],
+    defaultModels: [GPT_IMAGE_2_MODEL, GPT_IMAGE_2_FAMILY_MODEL],
     supportedAspectRatios: OPENAI_ASPECT_RATIOS,
     supportsReferenceImages: true,
     supportsNegativePrompt: true,
@@ -764,8 +782,8 @@ const PROTOCOLS: Array<{
     shortLabel: "Gemini",
     description: "Google Gemini 原生 generateContent 生图/改图",
     defaultBaseUrl: DEFAULT_API_URL,
-    defaultModels: ["gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
-    supportedAspectRatios: ALL_ASPECT_RATIOS,
+    defaultModels: [GEMINI_3_PRO_IMAGE_MODEL, "gemini-2.5-flash-image", "gemini-2.0-flash-preview-image-generation"],
+    supportedAspectRatios: [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS],
     supportsReferenceImages: true,
     supportsNegativePrompt: true,
     supportsQuality: false,
@@ -1610,12 +1628,42 @@ function getAspectDefinition(value: string) {
   return ASPECT_RATIOS.find((ratio) => ratio.value === value) || ASPECT_RATIOS[0];
 }
 
+function normalizedImageModelId(model = "") {
+  return model.replace(/^models\//, "").trim().toLowerCase();
+}
+
+function isGptImage2Model(model = "") {
+  const normalized = normalizedImageModelId(model);
+  return normalized === GPT_IMAGE_2_MODEL || normalized === GPT_IMAGE_2_FAMILY_MODEL || normalized.includes("image-2");
+}
+
+function isGemini3ProImageModel(model = "") {
+  return normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL;
+}
+
+function protocolForImageModel(model: string, fallback: ImageProtocol = DEFAULT_PROTOCOL): ImageProtocol {
+  if (isGemini3ProImageModel(model)) return "gemini-native";
+  if (isGptImage2Model(model)) {
+    return fallback === "openai-images" ? "openai-images" : "custom-openai";
+  }
+  return fallback;
+}
+
+function protocolMatchesImageModel(protocol: ImageProtocol, model = "") {
+  if (!model) return true;
+  if (isGemini3ProImageModel(model)) return protocol === "gemini-native";
+  if (isGptImage2Model(model)) return protocol === "custom-openai" || protocol === "openai-images";
+  return true;
+}
+
+function imageModelLaneLabel(model: string) {
+  if (isGemini3ProImageModel(model)) return "Gemini 原生接口";
+  if (isGptImage2Model(model)) return "GPT Image 2 接口";
+  return "图片模型";
+}
+
 function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
-  const normalized = model.replace(/^models\//, "").trim().toLowerCase();
-  const isImage2 = normalized === "gpt-image-2"
-    || normalized === "gpt-5.4-image-2"
-    || normalized.includes("image-2");
-  return isImage2 && (
+  return isGptImage2Model(model) && (
     protocol === "custom-openai"
     || protocol === "openai-images"
     || protocol === "openai-responses"
@@ -1623,6 +1671,9 @@ function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
 }
 
 function getSupportedAspectRatios(protocol: ImageProtocol, model = "") {
+  if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
+    return [...GEMINI_3_PRO_SUPPORTED_ASPECT_RATIOS];
+  }
   if (usesOfficialGptImageSizing(protocol, model)) {
     return [...GPT_IMAGE_SUPPORTED_ASPECT_RATIOS];
   }
@@ -1648,6 +1699,13 @@ function scaleSize(size: string, resolution: ImageResolution) {
   return `${Math.round(width * multiplier)}x${Math.round(height * multiplier)}`;
 }
 
+function baseSizeForModel(aspectRatio: string, protocol: ImageProtocol, model = "") {
+  if (isGemini3ProImageModel(model) && protocol === "gemini-native") {
+    return GEMINI_3_PRO_SIZE_BY_RATIO[aspectRatio] || GEMINI_3_PRO_SIZE_BY_RATIO["1:1"];
+  }
+  return SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
+}
+
 function resolveSize(aspectRatio: string, resolution: ImageResolution = DEFAULT_IMAGE_RESOLUTION) {
   const baseSize = SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
   return scaleSize(baseSize, safeImageResolution(resolution));
@@ -1659,7 +1717,7 @@ function resolveRequestSize(
   protocol: ImageProtocol,
   model = "",
 ) {
-  const baseSize = SIZE_BY_RATIO[aspectRatio] || SIZE_BY_RATIO["1:1"];
+  const baseSize = baseSizeForModel(aspectRatio, protocol, model);
   if (usesOfficialGptImageSizing(protocol, model)) return baseSize;
   return scaleSize(baseSize, safeImageResolution(resolution));
 }
@@ -2550,15 +2608,15 @@ function loadInitialParams(): ImageParams {
 }
 
 function isAllowedImageModel(model: string) {
-  const normalized = model.toLowerCase();
-  return normalized === "gpt-image-2" || normalized === "gpt-5.4-image-2" || normalized.includes("image-2");
+  return isGptImage2Model(model) || isGemini3ProImageModel(model);
 }
 
 function imageModelPriority(model: string) {
-  const normalized = model.toLowerCase();
-  if (normalized === "gpt-image-2") return 0;
-  if (normalized === "gpt-5.4-image-2") return 1;
-  return 2;
+  const normalized = normalizedImageModelId(model);
+  if (normalized === GPT_IMAGE_2_MODEL) return 0;
+  if (normalized === GPT_IMAGE_2_FAMILY_MODEL) return 1;
+  if (normalized === GEMINI_3_PRO_IMAGE_MODEL) return 2;
+  return 10;
 }
 
 function filterAllowedImageModels(models: string[]) {
@@ -2574,11 +2632,19 @@ function preferModel(models: string[], current: string) {
   const allowedModels = filterAllowedImageModels(models);
   if (current && allowedModels.includes(current) && isAllowedImageModel(current)) return current;
   return (
-    allowedModels.find((model) => model.toLowerCase() === "gpt-image-2") ||
-    allowedModels.find((model) => model.toLowerCase() === "gpt-5.4-image-2") ||
+    allowedModels.find((model) => normalizedImageModelId(model) === GPT_IMAGE_2_MODEL) ||
+    allowedModels.find((model) => normalizedImageModelId(model) === GPT_IMAGE_2_FAMILY_MODEL) ||
+    allowedModels.find((model) => normalizedImageModelId(model) === GEMINI_3_PRO_IMAGE_MODEL) ||
     allowedModels[0] ||
     ""
   );
+}
+
+function imageModelsForProtocol(protocol: ImageProtocol, upstreamModels: string[] = []) {
+  return filterAllowedImageModels([
+    ...upstreamModels,
+    ...getProtocolDefinition(protocol).defaultModels,
+  ]).filter((model) => protocolMatchesImageModel(protocol, model));
 }
 
 function normalizedModelId(model: string) {
@@ -3170,16 +3236,22 @@ export default function App() {
     selectedModel,
   );
   const aspectRatioSupported = isAspectRatioSupported(apiConfig.protocol, params.aspectRatio, selectedModel);
+  const selectedAspectHint = isGemini3ProImageModel(selectedModel)
+    ? "Gemini 3 Pro 官方支持比例"
+    : selectedAspectRatio.hint;
   const composerConfigSummary = `${params.batchCount}张 · ${params.aspectRatio} · ${selectedResolution}`;
   const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
 
+  const selectableImageModels = useMemo(
+    () => filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]),
+    [models],
+  );
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
-    return models
-      .filter(isAllowedImageModel)
+    return selectableImageModels
       .filter((model) => model.toLowerCase().includes(query))
       .slice(0, 80);
-  }, [modelFilter, models]);
+  }, [modelFilter, selectableImageModels]);
   const preferredAnalysisModel = useMemo(
     () => preferAnalysisModel(analysisModels, selectedAnalysisModel),
     [analysisModels, selectedAnalysisModel],
@@ -3229,7 +3301,7 @@ export default function App() {
     || agentModeState.status === "receiving"
   );
   const modelStatusMessage = isAutoLoadingModels
-    ? "正在自动验证 API Key 并读取 image-2 模型..."
+    ? "正在自动验证 API Key 并读取图片模型..."
     : isModelConnectionVerified && verifiedModelAt
       ? `${modelState.message} · ${formatDate(verifiedModelAt)}`
       : modelState.message;
@@ -3239,6 +3311,7 @@ export default function App() {
     selectedModel.length > 0 &&
     isAllowedImageModel(selectedModel) &&
     models.includes(selectedModel) &&
+    protocolMatchesImageModel(apiConfig.protocol, selectedModel) &&
     isModelConnectionVerified &&
     aspectRatioSupported;
   const canRequestGenerate = canGenerate && !isPromptAnalyzing && !analysisCountdown && !isAgentModeBusy;
@@ -3432,7 +3505,7 @@ export default function App() {
       setVerifiedModelKey("");
       setVerifiedModelAt(0);
       setModels([]);
-      setSelectedModel("");
+      setSelectedModel((current) => protocolMatchesImageModel(apiConfig.protocol, current) ? current : "");
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "idle", message: "填写 API Key 后自动验证" });
@@ -3444,7 +3517,7 @@ export default function App() {
       setVerifiedModelKey("");
       setVerifiedModelAt(0);
       setModels([]);
-      setSelectedModel("");
+      setSelectedModel((current) => protocolMatchesImageModel(apiConfig.protocol, current) ? current : "");
       setAnalysisModels([]);
       setSelectedAnalysisModel("");
       setModelState({ status: "idle", message: "API Key 已变化，等待自动验证" });
@@ -3988,10 +4061,10 @@ export default function App() {
       if (upstreamModels.length === 0) {
         throw new Error("接口返回了空模型列表");
       }
-      const nextModels = filterAllowedImageModels(upstreamModels);
+      const nextModels = imageModelsForProtocol(config.protocol, upstreamModels);
       const nextAnalysisModels = filterAnalysisModels(upstreamModels);
       if (nextModels.length === 0) {
-        throw new Error("未找到可用的 image-2 模型");
+        throw new Error("未找到可用的图片模型");
       }
       const nextSelectedModel = preferModel(nextModels, selectedModel);
       const nextSelectedAnalysisModel = preferAnalysisModel(nextAnalysisModels, selectedAnalysisModel);
@@ -4003,12 +4076,12 @@ export default function App() {
       setAnalysisModels(nextAnalysisModels);
       setSelectedAnalysisModel(nextSelectedAnalysisModel);
       setModelFilter("");
-      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个 image-2 模型` });
+      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个图片模型` });
       pushLocalLog({
         type: "model_load",
         level: "success",
         title: silent ? "自动读取模型成功" : "读取模型成功",
-        message: `已读取 ${nextModels.length} 个 image-2 模型，选中 ${nextSelectedModel}。`,
+        message: `已读取 ${nextModels.length} 个图片模型，选中 ${nextSelectedModel}。`,
         endpoint: "/api/models",
         durationMs: Date.now() - startedAt,
         params: apiLogSnapshot(config),
@@ -4097,10 +4170,10 @@ export default function App() {
       if (!response.ok || !payload.ok) {
         throw payload.detail || payload;
       }
-      const nextModels = filterAllowedImageModels(Array.isArray(payload.models) ? payload.models : []);
+      const nextModels = imageModelsForProtocol(apiConfig.protocol, Array.isArray(payload.models) ? payload.models : []);
       const nextAnalysisModels = filterAnalysisModels(Array.isArray(payload.models) ? payload.models : []);
       if (nextModels.length === 0) {
-        throw new Error("未找到可用的 image-2 模型");
+        throw new Error("未找到可用的图片模型");
       }
       setVerifiedModelKey(modelLoadKey);
       setVerifiedModelAt(Date.now());
@@ -4113,7 +4186,7 @@ export default function App() {
           type: "api_health",
           level: "warning",
           title: "提交前验证通过但模型已刷新",
-          message: "当前选中模型不在最新 image-2 模型列表中，已自动改选，需要用户再次确认生成。",
+          message: "当前选中模型不在最新图片模型列表中，已自动改选，需要用户再次确认生成。",
           endpoint: "/api/models",
           durationMs: Date.now() - startedAt,
           params: apiLogSnapshot(),
@@ -4125,12 +4198,12 @@ export default function App() {
         });
         return false;
       }
-      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个 image-2 模型` });
+      setModelState({ status: "ready", message: `API Key 有效 · ${nextModels.length} 个图片模型` });
       pushLocalLog({
         type: "api_health",
         level: "success",
         title: "提交前验证通过",
-        message: `API Key 可用，已确认 ${nextModels.length} 个 image-2 模型。`,
+        message: `API Key 可用，已确认 ${nextModels.length} 个图片模型。`,
         endpoint: "/api/models",
         durationMs: Date.now() - startedAt,
         params: apiLogSnapshot(),
@@ -5016,6 +5089,7 @@ export default function App() {
       !selectedModel ||
       !isAllowedImageModel(selectedModel) ||
       !models.includes(selectedModel) ||
+      !protocolMatchesImageModel(apiConfig.protocol, selectedModel) ||
       modelState.status !== "ready" ||
       !isAspectRatioSupported(apiConfig.protocol, batchParams.aspectRatio, selectedModel)
     ) {
@@ -5614,7 +5688,7 @@ export default function App() {
 
   function changeProtocol(protocol: ImageProtocol) {
     const nextDefinition = getProtocolDefinition(protocol);
-    const nextModels = filterAllowedImageModels(nextDefinition.defaultModels);
+    const nextModels = imageModelsForProtocol(protocol, nextDefinition.defaultModels);
     const nextAnalysisModels = filterAnalysisModels(nextDefinition.defaultModels);
     setApiConfig((current) => {
       return {
@@ -5630,9 +5704,40 @@ export default function App() {
     setModelFilter("");
     setModelState(
       nextModels.length > 0
-        ? { status: "ready", message: `${nextModels.length} 个预设 image-2 模型` }
-        : { status: "idle", message: "等待读取 image-2 模型" },
+        ? { status: "idle", message: `${nextModels.length} 个预设图片模型，等待验证` }
+        : { status: "idle", message: "等待读取图片模型" },
     );
+  }
+
+  function selectImageModel(model: string) {
+    const nextModel = model.trim();
+    if (!isAllowedImageModel(nextModel)) return;
+    const nextProtocol = protocolForImageModel(nextModel, apiConfig.protocol);
+    const protocolChanged = nextProtocol !== apiConfig.protocol;
+    const nextDefinition = getProtocolDefinition(nextProtocol);
+    const nextModels = imageModelsForProtocol(nextProtocol, [...models, nextModel]);
+    const nextAnalysisModels = filterAnalysisModels(nextDefinition.defaultModels);
+    if (protocolChanged) {
+      setVerifiedModelKey("");
+      setVerifiedModelAt(0);
+      setAnalysisModels(nextAnalysisModels);
+      setSelectedAnalysisModel((current) => preferAnalysisModel(nextAnalysisModels, current));
+      setModelState({
+        status: "idle",
+        message: `已切换到 ${nextDefinition.shortLabel} 通道，等待自动验证`,
+      });
+    }
+    setApiConfig((current) => {
+      if (current.protocol === nextProtocol) return current;
+      return {
+        ...current,
+        protocol: nextProtocol,
+        baseUrl: normalizeApiBaseUrl(current.baseUrl),
+      };
+    });
+    setModels(nextModels);
+    setSelectedModel(nextModel);
+    setModelFilter("");
   }
 
   function downloadCurrent(job: Job | HistoryRecord) {
@@ -7127,7 +7232,7 @@ export default function App() {
         <section className="settings-section" data-onboarding-target="model">
           <div className="section-label with-note">
             <span>可用生图模型</span>
-            <small>仅显示 gpt-image-2、gpt-5.4-image-2 或包含 image-2 的模型</small>
+            <small>支持 GPT Image 2 与 Gemini 3 Pro Image Preview，选择后自动切换接口格式</small>
           </div>
           <div className="search-input">
             <Search size={16} />
@@ -7140,7 +7245,7 @@ export default function App() {
           <div className="model-list">
             {filteredModels.length === 0 ? (
               <div className="muted-box">
-                {models.length === 0 ? "暂无可用 image-2 模型" : "无匹配模型"}
+                {selectableImageModels.length === 0 ? "暂无可用图片模型" : "无匹配模型"}
               </div>
             ) : (
               filteredModels.map((model) => (
@@ -7148,9 +7253,10 @@ export default function App() {
                   type="button"
                   key={model}
                   className={selectedModel === model ? "selected" : ""}
-                  onClick={() => setSelectedModel(model)}
+                  onClick={() => selectImageModel(model)}
                 >
-                  {model}
+                  <span>{model}</span>
+                  <small>{imageModelLaneLabel(model)}</small>
                 </button>
               ))
             )}
@@ -7176,7 +7282,7 @@ export default function App() {
           </label>
           <div className={`ratio-preview ${aspectRatioSupported ? "" : "unsupported"}`}>
             <strong>{selectedAspectRatio.value}</strong>
-            <span>{selectedAspectRatio.hint}</span>
+            <span>{selectedAspectHint}</span>
             <small>{aspectRatioSupported ? `${selectedResolution} · 请求尺寸 ${resolvedRequestSize}` : "当前协议不支持此比例"}</small>
           </div>
           <label>
@@ -7196,7 +7302,7 @@ export default function App() {
           <div className="ratio-preview">
             <strong>{selectedResolution}</strong>
             <span>{selectedResolutionDefinition.hint}</span>
-            <small>{isOfficialGptImageSizeMode ? "GPT Image 2 当前仅使用官方固定尺寸，不额外放大" : "尺寸会随宽高比自动换算"}</small>
+            <small>{isOfficialGptImageSizeMode ? "GPT Image 2 当前仅使用官方固定尺寸，不额外放大" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : "尺寸会随宽高比自动换算"}</small>
           </div>
           <label>
             <span>质量</span>
@@ -8157,6 +8263,7 @@ function SquarePage({
   const [error, setError] = useState("");
   const [quota, setQuota] = useState<SquareQuotaResponse | null>(null);
   const [pendingLikeIds, setPendingLikeIds] = useState<Set<string>>(() => new Set());
+  const [previewItem, setPreviewItem] = useState<SquareFeedItem | null>(null);
   const pageRef = useRef<HTMLElement | null>(null);
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const apiKeyReady = apiKey.trim().length >= API_KEY_MIN_LENGTH;
@@ -8167,8 +8274,9 @@ function SquarePage({
       return;
     }
     try {
-      const query = new URLSearchParams({ apiKey });
-      const response = await fetch(`/api/square/quota?${query.toString()}`);
+      const response = await fetch("/api/square/quota", {
+        headers: { "x-imagehub-api-key": apiKey },
+      });
       const payload = await readApiJson<SquareQuotaResponse>(response, "/api/square/quota");
       if (!response.ok || !payload.ok) throw payload;
       setQuota(payload);
@@ -8188,8 +8296,9 @@ function SquarePage({
         limit: String(SQUARE_PAGE_SIZE),
       });
       if (!reset && cursor) query.set("cursor", cursor);
-      if (apiKeyReady) query.set("apiKey", apiKey);
-      const response = await fetch(`/api/square/feed?${query.toString()}`);
+      const headers: Record<string, string> = {};
+      if (apiKeyReady) headers["x-imagehub-api-key"] = apiKey;
+      const response = await fetch(`/api/square/feed?${query.toString()}`, { headers });
       const payload = await readApiJson<SquareFeedResponse>(response, "/api/square/feed");
       if (!response.ok || !payload.ok) throw payload;
       setItems((current) => reset ? payload.items : mergeSquareItems(current, payload.items));
@@ -8210,19 +8319,29 @@ function SquarePage({
     void fetchQuota();
   }, [tab, apiKey]);
 
+  const loadFeedRef = useRef(loadFeed);
+  loadFeedRef.current = loadFeed;
+  const canLoadMore = hasMore && !isLoading;
+
   useEffect(() => {
     const marker = loadMoreRef.current;
     const root = pageRef.current;
-    if (!marker || !root || !hasMore || isLoading) return;
+    if (!marker || !root || !canLoadMore) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries.some((entry) => entry.isIntersecting)) void loadFeed(false);
+        if (entries.some((entry) => entry.isIntersecting)) void loadFeedRef.current(false);
       },
       { root, rootMargin: "420px 0px", threshold: 0 },
     );
     observer.observe(marker);
     return () => observer.disconnect();
-  }, [items.length, hasMore, isLoading, cursor, tab, apiKey]);
+  }, [canLoadMore]);
+
+  useEffect(() => {
+    if (!previewItem) return;
+    const updated = items.find((item) => item.id === previewItem.id);
+    if (updated && updated !== previewItem) setPreviewItem(updated);
+  }, [items, previewItem]);
 
   async function toggleLike(item: SquareFeedItem) {
     if (!apiKeyReady) {
@@ -8282,19 +8401,26 @@ function SquarePage({
       </header>
 
       <section className="square-hero">
-        <div>
+        <div className="square-hero-copy">
           <span className="home-kicker">Square</span>
           <h1>广场</h1>
-          <p>这里展示被推荐出来的 1K 创作缩略图。点赞、推荐和替换都由服务端记录配额与日志。</p>
-        </div>
-        <div className="square-quota-strip" aria-label="广场配额">
-          <span>{apiKeyReady ? "API Key 已配置" : "未配置 API Key"}</span>
-          <strong>{quota ? `${quota.shelfCount}/${quota.shelfLimit}` : "-/4"}</strong>
-          <small>展示位</small>
-          <strong>{quota ? quota.dailyRecommendLeft : "-"}</strong>
-          <small>今日推荐剩余</small>
-          <strong>{quota ? quota.dailyLikeLeft : "-"}</strong>
-          <small>今日点赞剩余</small>
+          <p>创作者推荐的 AI 生成作品在这里展示。点赞你喜欢的创作，或者推荐你的得意之作。</p>
+          {items.length > 0 && (
+            <div className="square-metric-row">
+              <div className="square-metric">
+                <strong>{quota ? `${quota.shelfCount}/${quota.shelfLimit}` : "-/4"}</strong>
+                <span>我的展示位</span>
+              </div>
+              <div className="square-metric">
+                <strong>{quota ? quota.dailyRecommendLeft : "-"}</strong>
+                <span>今日推荐</span>
+              </div>
+              <div className="square-metric">
+                <strong>{quota ? quota.dailyLikeLeft : "-"}</strong>
+                <span>今日点赞</span>
+              </div>
+            </div>
+          )}
         </div>
       </section>
 
@@ -8339,6 +8465,7 @@ function SquarePage({
             pendingLike={pendingLikeIds.has(item.id)}
             onLike={() => void toggleLike(item)}
             onCopyPrompt={() => void navigator.clipboard.writeText(item.prompt)}
+            onPreview={() => setPreviewItem(item)}
           />
         ))}
         {isLoading && Array.from({ length: Math.max(4, SQUARE_PAGE_SIZE / 4) }, (_, index) => (
@@ -8350,20 +8477,62 @@ function SquarePage({
       </section>
 
       {!isLoading && items.length === 0 && (
-        <div className="square-empty">
-          <ImagePlus size={26} />
-          <strong>广场还没有作品</strong>
-          <span>在工作台生成成功后，点击结果左下角的推荐按钮即可上架。</span>
-          <button type="button" className="primary-action compact" onClick={onEnterStudio}>
-            <WandSparkles size={15} />
-            去生成
+        <div className="square-onboarding">
+          <div className="square-onboarding-header">
+            <h2>还没有作品，成为第一个推荐者</h2>
+            <p>只需三步，你的创作就会出现在广场上。</p>
+          </div>
+          <div className="square-steps">
+            <article className="square-step">
+              <span className="square-step-icon"><WandSparkles size={22} /></span>
+              <strong>生成作品</strong>
+              <p>在工作台输入提示词，选择模型和参数，提交生成。</p>
+            </article>
+            <span className="square-step-arrow"><ArrowRight size={18} /></span>
+            <article className="square-step">
+              <span className="square-step-icon"><ImagePlus size={22} /></span>
+              <strong>点击推荐</strong>
+              <p>生成成功后，点击结果左下角的「推荐广场」按钮。</p>
+            </article>
+            <span className="square-step-arrow"><ArrowRight size={18} /></span>
+            <article className="square-step">
+              <span className="square-step-icon"><Star size={22} /></span>
+              <strong>展示与互动</strong>
+              <p>作品出现在广场，其他创作者可以浏览和点赞。</p>
+            </article>
+          </div>
+          <button type="button" className="square-onboarding-cta" onClick={onEnterStudio}>
+            开始创作
+            <ArrowRight size={18} />
           </button>
+          <div className="square-ghost-grid" aria-hidden="true">
+            {Array.from({ length: 4 }, (_, i) => (
+              <div className="square-ghost-card" key={i}>
+                <div className="square-ghost-image" />
+                <div className="square-ghost-body">
+                  <div className="square-ghost-line wide" />
+                  <div className="square-ghost-line narrow" />
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
       {hasMore && <div ref={loadMoreRef} className="load-more-sentinel" />}
       {isLoading && <div className="load-more-state">加载中...</div>}
       {!hasMore && items.length > 0 && <div className="load-more-state">已经到底了</div>}
+      {previewItem && (
+        <SquarePreviewModal
+          item={previewItem}
+          apiKeyReady={apiKeyReady}
+          pendingLike={pendingLikeIds.has(previewItem.id)}
+          onClose={() => setPreviewItem(null)}
+          onLike={() => void toggleLike(previewItem)}
+          onCopyPrompt={() => void navigator.clipboard.writeText(previewItem.prompt)}
+          onDownload={() => downloadUrl(previewItem.thumbnailUrl, `${sanitizeFilename(previewItem.caption || previewItem.id)}.png`)}
+        />
+      )}
     </main>
   );
 }
@@ -8379,21 +8548,27 @@ function SquareCard({
   pendingLike,
   onLike,
   onCopyPrompt,
+  onPreview,
 }: {
   item: SquareFeedItem;
   apiKeyReady: boolean;
   pendingLike: boolean;
   onLike: () => void;
   onCopyPrompt: () => void;
+  onPreview: () => void;
 }) {
   const params = item.params || {};
   const sizeLabel = item.width && item.height ? `${item.width} x ${item.height}` : String(params.size || "-");
   return (
     <article className="square-card">
-      <a className="square-card-image" href={item.thumbnailDataUrl} target="_blank" rel="noreferrer" title="打开展示图">
-        <img src={item.thumbnailDataUrl} alt={item.caption || item.prompt} loading="lazy" decoding="async" />
+      <button className="square-card-image" type="button" title="预览作品" onClick={onPreview}>
+        <img src={item.thumbnailUrl} alt={item.caption || item.prompt} loading="lazy" decoding="async" />
         <span>{item.pageLabel || item.recommenderLabel}</span>
-      </a>
+        <strong>
+          <Maximize2 size={15} />
+          预览
+        </strong>
+      </button>
       <div className="square-card-body">
         <div className="square-card-title">
           <strong title={item.caption || item.prompt}>{item.caption || "未命名作品"}</strong>
@@ -8420,12 +8595,91 @@ function SquareCard({
           <button type="button" className="icon-button" title="复制提示词" onClick={onCopyPrompt}>
             <Copy size={15} />
           </button>
-          <a className="icon-button" title="打开展示图" href={item.thumbnailDataUrl} target="_blank" rel="noreferrer">
-            <ExternalLink size={15} />
-          </a>
+          <button type="button" className="icon-button" title="预览作品" onClick={onPreview}>
+            <Maximize2 size={15} />
+          </button>
         </div>
       </div>
     </article>
+  );
+}
+
+function SquarePreviewModal({
+  item,
+  apiKeyReady,
+  pendingLike,
+  onClose,
+  onLike,
+  onCopyPrompt,
+  onDownload,
+}: {
+  item: SquareFeedItem;
+  apiKeyReady: boolean;
+  pendingLike: boolean;
+  onClose: () => void;
+  onLike: () => void;
+  onCopyPrompt: () => void;
+  onDownload: () => void;
+}) {
+  const params = item.params || {};
+  const sizeLabel = item.width && item.height ? `${item.width} x ${item.height}` : String(params.size || "-");
+  const promptTitle = item.caption || "广场作品";
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  return (
+    <div className="square-preview-modal" role="dialog" aria-modal="true" aria-label="广场作品预览">
+      <button className="preview-backdrop" type="button" aria-label="关闭预览" onClick={onClose} />
+      <div className="square-preview-shell">
+        <div className="square-preview-stage">
+          <img src={item.thumbnailUrl} alt={promptTitle} />
+        </div>
+        <aside className="square-preview-side">
+          <div className="preview-head">
+            <div>
+              <strong title={promptTitle}>{promptTitle}</strong>
+              <span>{formatDate(item.createdAt)} · {item.recommenderLabel}</span>
+            </div>
+            <button type="button" className="icon-button" onClick={onClose} title="关闭">
+              <X size={17} />
+            </button>
+          </div>
+          <div className="square-preview-meta">
+            <span>{item.model}</span>
+            <span>{String(params.aspectRatio || item.aspectRatio || "-")}</span>
+            <span>{String(params.resolution || DEFAULT_IMAGE_RESOLUTION)}</span>
+            <span>{sizeLabel}</span>
+            {item.pageLabel && <span>{item.pageLabel}</span>}
+          </div>
+          <div className="square-preview-prompt">{item.prompt}</div>
+          <div className="square-preview-actions">
+            <button
+              type="button"
+              className={`square-like-button ${item.likedByRequester ? "liked" : ""}`}
+              disabled={!apiKeyReady || pendingLike}
+              title={apiKeyReady ? item.likedByRequester ? "取消点赞" : "点赞" : "配置 API Key 后可点赞"}
+              onClick={onLike}
+            >
+              {pendingLike ? <Loader2 size={15} className="spin" /> : <Heart size={15} />}
+              <span>{item.likeCount}</span>
+            </button>
+            <button type="button" className="subtle-button" onClick={onCopyPrompt}>
+              <Copy size={15} />
+              复制提示词
+            </button>
+            <button type="button" className="subtle-button" onClick={onDownload}>
+              <Download size={15} />
+              下载预览图
+            </button>
+          </div>
+        </aside>
+      </div>
+    </div>
   );
 }
 
