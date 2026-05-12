@@ -7,7 +7,7 @@ import {
   scryptSync,
   timingSafeEqual,
 } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { defineConfig, type PluginOption, type ViteDevServer } from "vite";
@@ -270,7 +270,6 @@ const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
 const ADMIN_STORE_PATH = join(DATA_DIR, "admin-store.json");
 const SQUARE_STORE_PATH = join(DATA_DIR, "square-store.json");
-const FRONTEND_VERSION_PATHS = ["src", "index.html", "package.json", "vite.config.ts"];
 const REFERENCE_TEMP_TTL_MS = 1000 * 60 * 10;
 const PUBLIC_REFERENCE_BASE_URL = "https://imagehub.taijiai.online";
 const SQUARE_TIME_ZONE = "Asia/Shanghai";
@@ -287,42 +286,58 @@ const temporaryReferences = new Map<string, {
   expiresAt: number;
 }>();
 
-function formatFrontendVersion(value: number) {
-  const date = new Date(value);
+const FRONTEND_BUILD_TIME_ZONE = "Asia/Shanghai";
+const FRONTEND_BUILD_DATE = new Date();
+
+function frontendDateParts(date: Date) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: FRONTEND_BUILD_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  });
+  return Object.fromEntries(
+    formatter.formatToParts(date)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  ) as Record<"year" | "month" | "day" | "hour" | "minute" | "second", string>;
+}
+
+function formatFrontendVersion(date: Date) {
+  const parts = frontendDateParts(date);
   const pad = (item: number, length = 2) => String(item).padStart(length, "0");
   return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-    pad(date.getSeconds()),
+    parts.year,
+    parts.month,
+    parts.day,
+    parts.hour,
+    parts.minute,
+    parts.second,
     pad(date.getMilliseconds(), 3),
   ].join("");
 }
 
-function latestModifiedAt(path: string): number {
-  if (!existsSync(path)) return 0;
-  const stat = statSync(path);
-  if (!stat.isDirectory()) return stat.mtimeMs;
-  return readdirSync(path)
-    .filter((item) => !item.startsWith("."))
-    .reduce((latest, item) => Math.max(latest, latestModifiedAt(join(path, item))), stat.mtimeMs);
+function formatFrontendBuiltAtLocal(date: Date) {
+  const parts = frontendDateParts(date);
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}.${String(date.getMilliseconds()).padStart(3, "0")} ${FRONTEND_BUILD_TIME_ZONE}`;
 }
 
 function createFrontendBuildVersion() {
-  if (process.env.FRONTEND_BUILD_VERSION) return process.env.FRONTEND_BUILD_VERSION;
-  const latest = FRONTEND_VERSION_PATHS.reduce(
-    (maxTime, path) => Math.max(maxTime, latestModifiedAt(join(process.cwd(), path))),
-    0,
-  );
-  return formatFrontendVersion(latest || Date.now());
+  const explicitVersion = process.env.FRONTEND_BUILD_VERSION?.trim();
+  if (explicitVersion) return explicitVersion.replace(/[^a-zA-Z0-9._-]/g, "");
+  return formatFrontendVersion(FRONTEND_BUILD_DATE);
 }
 
 const FRONTEND_BUILD_VERSION = createFrontendBuildVersion();
 const FRONTEND_BUILD_INFO = {
   version: FRONTEND_BUILD_VERSION,
-  builtAt: new Date().toISOString(),
+  builtAt: FRONTEND_BUILD_DATE.toISOString(),
+  builtAtLocal: formatFrontendBuiltAtLocal(FRONTEND_BUILD_DATE),
+  timeZone: FRONTEND_BUILD_TIME_ZONE,
 };
 
 const adminSessions = new Map<string, { username: string; expiresAt: number }>();
