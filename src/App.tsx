@@ -628,6 +628,7 @@ const LARGE_REFERENCE_EDGE = 4096;
 const PROMPT_TEXTAREA_MAX_HEIGHT = 220;
 const FRONTEND_VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const API_KEY_MIN_LENGTH = 8;
+const DISMISSED_FRONTEND_VERSION_KEY = "sumapiDismissedFrontendVersion";
 const AGENT_MODE_STORAGE_KEY = "imageStudioAgentModeEnabled";
 const AGENT_MODE_NAME = "Agent 模式 A";
 const SQUARE_FEED_TABS: Array<{ value: SquareFeedTab; label: string; icon: typeof Clock3 }> = [
@@ -2366,6 +2367,7 @@ function serializeError(detail: ErrorDetail) {
 async function fetchFrontendBuildVersion(signal?: AbortSignal) {
   const response = await fetch(`/build-version.json?t=${Date.now()}`, {
     cache: "no-store",
+    headers: { "Cache-Control": "no-cache" },
     signal,
   });
   if (!response.ok) throw new Error(`版本检查失败：HTTP ${response.status}`);
@@ -2376,7 +2378,8 @@ async function fetchFrontendBuildVersion(signal?: AbortSignal) {
 function reloadWithFrontendVersion(version: string) {
   const nextUrl = new URL(window.location.href);
   nextUrl.searchParams.set("app_v", version);
-  window.location.assign(nextUrl.toString());
+  window.location.replace(nextUrl.toString());
+  window.setTimeout(() => window.location.reload(), 50);
 }
 
 function loadBooleanSetting(key: string, fallback: boolean) {
@@ -3377,7 +3380,10 @@ export default function App() {
     const checkVersion = async () => {
       try {
         const latestVersion = await fetchFrontendBuildVersion(controller.signal);
-        if (!stopped && latestVersion && latestVersion !== CURRENT_FRONTEND_VERSION) {
+        const dismissedVersion = localStorage.getItem(DISMISSED_FRONTEND_VERSION_KEY) || "";
+        if (!stopped && latestVersion && latestVersion === CURRENT_FRONTEND_VERSION) {
+          setAvailableFrontendVersion("");
+        } else if (!stopped && latestVersion && latestVersion !== CURRENT_FRONTEND_VERSION && latestVersion !== dismissedVersion) {
           setAvailableFrontendVersion(latestVersion);
         }
       } catch {
@@ -6077,7 +6083,10 @@ export default function App() {
     <FrontendUpdateNotice
       version={availableFrontendVersion}
       onRefresh={() => reloadWithFrontendVersion(availableFrontendVersion)}
-      onDismiss={() => setAvailableFrontendVersion("")}
+      onDismiss={() => {
+        localStorage.setItem(DISMISSED_FRONTEND_VERSION_KEY, availableFrontendVersion);
+        setAvailableFrontendVersion("");
+      }}
     />
   ) : null;
 

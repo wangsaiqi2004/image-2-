@@ -4170,9 +4170,6 @@ function frontendVersionPlugin(): PluginOption {
     configureServer(server: ViteDevServer) {
       registerBuildVersion(server);
     },
-    configurePreviewServer(server: PreviewServer) {
-      registerBuildVersion(server);
-    },
     generateBundle() {
       this.emitFile({
         type: "asset",
