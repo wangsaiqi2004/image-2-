@@ -1660,8 +1660,7 @@ function imageModelLaneLabel(model: string) {
 
 function usesOfficialGptImageSizing(protocol: ImageProtocol, model = "") {
   return isGptImage2Model(model) && (
-    protocol === "custom-openai"
-    || protocol === "openai-images"
+    protocol === "openai-images"
     || protocol === "openai-responses"
   );
 }
@@ -7303,7 +7302,7 @@ export default function App() {
           <div className="ratio-preview">
             <strong>{selectedResolution}</strong>
             <span>{selectedResolutionDefinition.hint}</span>
-            <small>{isOfficialGptImageSizeMode ? "GPT Image 2 当前仅使用官方固定尺寸，不额外放大" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : "尺寸会随宽高比自动换算"}</small>
+            <small>{isOfficialGptImageSizeMode ? "官方 OpenAI 模式使用固定像素尺寸" : isGemini3ProImageModel(selectedModel) ? "Gemini 3 Pro 会以 imageSize 传递 1K/2K/4K" : "尺寸会随宽高比和分辨率自动换算"}</small>
           </div>
           <label>
             <span>质量</span>

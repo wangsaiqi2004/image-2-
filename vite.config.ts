@@ -1243,6 +1243,10 @@ const SIZE_BY_RATIO: Record<string, string> = {
   "16:9": "1792x1024",
   "21:9": "2016x864",
   "9:21": "864x2016",
+  "4:1": "2048x512",
+  "1:4": "512x2048",
+  "8:1": "2048x256",
+  "1:8": "256x2048",
 };
 
 const RESOLUTION_MULTIPLIER: Record<string, number> = {
@@ -1264,7 +1268,7 @@ function scaleSize(size: string, resolution = "1K") {
 }
 
 function imageSizeForProtocol(request: GenerateRequest, protocol: ImageProtocol) {
-  if (isGptImage2Model(request.model) && request.aspectRatio) {
+  if (protocol === "openai-images" && isGptImage2Model(request.model) && request.aspectRatio) {
     return SIZE_BY_RATIO[request.aspectRatio] || SIZE_BY_RATIO["1:1"];
   }
   return request.aspectRatio
