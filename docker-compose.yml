@@ -1,0 +1,14 @@
+services:
+  sum-image:
+    build: .
+    container_name: sum-image
+    environment:
+      NODE_ENV: production
+      SUM_IMAGE_PUBLIC_BASE_URL: ${SUM_IMAGE_PUBLIC_BASE_URL:-}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_INITIAL_PASSWORD: ${ADMIN_INITIAL_PASSWORD:-admin123456}
+    ports:
+      - "127.0.0.1:${SUM_IMAGE_HOST_PORT:-3010}:8877"
+    volumes:
+      - ./.data:/app/.data
+    restart: unless-stopped

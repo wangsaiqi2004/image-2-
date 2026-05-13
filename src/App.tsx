@@ -51,7 +51,7 @@ import {
 import homeHeroImage from "./assets/home-hero.png";
 import homePromptPreview from "./assets/home-prompt-preview.png";
 import homeStudioPreview from "./assets/home-studio-preview.png";
-import imageStudioLogo from "./assets/image-studio-logo.svg";
+import sumapiLogo from "./assets/sumapi-logo.svg";
 
 type ImageProtocol =
   | "custom-openai"
@@ -642,14 +642,9 @@ const CURRENT_FRONTEND_VERSION = typeof __FRONTEND_BUILD_VERSION__ === "string"
   : "dev";
 const ALLOWED_API_ENDPOINTS = [
   {
-    value: "https://www.taijiai.online/",
-    label: "太极 AI",
-    description: "主服务地址",
-  },
-  {
-    value: "https://bobdong.cn/",
-    label: "BobDong",
-    description: "备用服务地址",
+    value: "https://api.clawopen.top/",
+    label: "SumAPI",
+    description: "默认 SumAPI 中转地址，也可以手动填写其他兼容地址",
   },
 ] as const;
 const DEFAULT_API_URL = ALLOWED_API_ENDPOINTS[0].value;
@@ -1619,9 +1614,9 @@ function isImageProtocol(value: string | null): value is ImageProtocol {
 }
 
 function normalizeApiBaseUrl(value: string | null | undefined) {
-  const normalized = String(value || "").trim().replace(/\/+$/, "");
-  const matched = ALLOWED_API_ENDPOINTS.find((endpoint) => endpoint.value.replace(/\/+$/, "") === normalized);
-  return matched?.value || DEFAULT_API_URL;
+  const normalized = String(value || "").trim();
+  if (!normalized) return DEFAULT_API_URL;
+  return `${normalized.replace(/\/+$/, "")}/`;
 }
 
 function getAspectDefinition(value: string) {
@@ -3766,7 +3761,7 @@ export default function App() {
         })),
       );
       const url = URL.createObjectURL(zipBlob);
-      downloadUrl(url, `image-studio-selected-${formatFileDate()}.zip`);
+      downloadUrl(url, `sumapi-selected-${formatFileDate()}.zip`);
       window.setTimeout(() => URL.revokeObjectURL(url), 1000);
     } finally {
       setIsBulkDownloading(false);
@@ -3891,7 +3886,7 @@ export default function App() {
 
   function exportLocalDiagnostics() {
     const exportedAt = new Date().toISOString();
-    const filename = `image-studio-local-diagnostics-${exportedAt.replace(/[:.]/g, "-")}.json`;
+    const filename = `sumapi-local-diagnostics-${exportedAt.replace(/[:.]/g, "-")}.json`;
     const refStatusBuckets: Record<ReferenceUploadStatus, number> = {
       none: 0,
       prepared: 0,
@@ -6134,10 +6129,10 @@ export default function App() {
         <div className="brand">
           <div className="brand-main">
             <div className="brand-mark">
-              <img src={imageStudioLogo} alt="" />
+              <img src={sumapiLogo} alt="" />
             </div>
             <div>
-              <strong>Image Studio</strong>
+              <strong>SumAPI</strong>
               <span>本地批量生图</span>
             </div>
           </div>
@@ -7144,19 +7139,16 @@ export default function App() {
           </div>
           <label>
             <span>API URL</span>
-            <select
+            <input
               value={apiConfig.baseUrl}
-              onChange={(event) => setApiConfig((current) => ({ ...current, baseUrl: normalizeApiBaseUrl(event.target.value) }))}
-            >
-              {ALLOWED_API_ENDPOINTS.map((endpoint) => (
-                <option key={endpoint.value} value={endpoint.value}>
-                  {endpoint.label} · {endpoint.value}
-                </option>
-              ))}
-            </select>
+              onChange={(event) => setApiConfig((current) => ({ ...current, baseUrl: event.target.value }))}
+              onBlur={(event) => setApiConfig((current) => ({ ...current, baseUrl: normalizeApiBaseUrl(event.target.value) }))}
+              placeholder="https://api.clawopen.top/"
+              spellCheck={false}
+            />
           </label>
           <div className="endpoint-note">
-            {ALLOWED_API_ENDPOINTS.find((endpoint) => endpoint.value === apiConfig.baseUrl)?.description || "固定服务地址"}
+            {ALLOWED_API_ENDPOINTS.find((endpoint) => endpoint.value === normalizeApiBaseUrl(apiConfig.baseUrl))?.description || "可填写 OpenAI / Google / Stability 等兼容接口地址"}
           </div>
           <label>
             <span>API Key</span>
@@ -7170,7 +7162,7 @@ export default function App() {
           <div className="prompt-group-hint api-key-hint" role="note">
             <WandSparkles size={14} />
             <span>
-              推荐使用 <strong>banana Pro 官转</strong> 或 <strong>OpenRouter</strong> 分组。
+              请先到 <strong>SumAPI / NewAPI</strong> 生成自己的 API Key，再回到这里填写使用。
             </span>
           </div>
           <label className="check-row">
@@ -7499,7 +7491,7 @@ function AdminApp({
       }
       const blob = await response.blob();
       const dispositionFilename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1];
-      const filename = dispositionFilename || `image-studio-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      const filename = dispositionFilename || `sumapi-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
       const url = URL.createObjectURL(blob);
       downloadUrl(url, filename);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -7522,7 +7514,7 @@ function AdminApp({
       }
       const blob = await response.blob();
       const dispositionFilename = response.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1];
-      const filename = dispositionFilename || `imagehub-square-audit-${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`;
+      const filename = dispositionFilename || `sumapi-square-audit-${new Date().toISOString().replace(/[:.]/g, "-")}.${format}`;
       const url = URL.createObjectURL(blob);
       downloadUrl(url, filename);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -7748,7 +7740,7 @@ function AdminApp({
     <main className="admin-page">
       <header className="admin-topbar">
         <div>
-          <span className="admin-badge"><img src={imageStudioLogo} alt="" /> Image Studio Admin</span>
+          <span className="admin-badge"><img src={sumapiLogo} alt="" /> SumAPI Admin</span>
           <h1>请求日志后台</h1>
         </div>
         <div className="admin-topbar-actions">
@@ -8083,13 +8075,13 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
           backgroundImage: `linear-gradient(90deg, rgba(247, 247, 245, 0.96) 0%, rgba(247, 247, 245, 0.84) 34%, rgba(247, 247, 245, 0.1) 72%), url(${homeHeroImage})`,
         }}
       >
-        <img className="home-hero-logo" src={imageStudioLogo} alt="" aria-hidden="true" />
+        <img className="home-hero-logo" src={sumapiLogo} alt="" aria-hidden="true" />
         <nav className="home-nav">
           <div className="home-brand">
             <span>
-              <img src={imageStudioLogo} alt="" />
+              <img src={sumapiLogo} alt="" />
             </span>
-            <strong>Image Studio</strong>
+            <strong>SumAPI</strong>
           </div>
           <div className="home-nav-links" aria-label="首页导航">
             <button type="button" onClick={() => scrollToSection("home-product")}>
@@ -8124,7 +8116,7 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
 
         <div className="home-hero-copy">
           <span className="home-kicker">AI image workspace</span>
-          <h1>Image Studio</h1>
+          <h1>SumAPI</h1>
           <p>
             从一句提示词，到一组可复用的视觉资产。把智能分析、批量生成、并行队列和本地图库，放进一个安静、清晰、反应迅速的创作空间。
           </p>
@@ -8178,13 +8170,13 @@ function HomePage({ onEnter, onSquare, onAdmin }: { onEnter: () => void; onSquar
           </p>
         </div>
         <figure className="home-preview-frame home-preview-frame-wide">
-          <img src={homeStudioPreview} alt="Image Studio 工作台截图，展示生成记录流、左侧历史和右侧配置面板" />
+          <img src={homeStudioPreview} alt="SumAPI 工作台截图，展示生成记录流、左侧历史和右侧配置面板" />
         </figure>
       </section>
 
       <section className="home-analysis-showcase" id="home-analysis">
         <div className="home-analysis-media">
-          <img src={homePromptPreview} alt="Image Studio 提示词输入和预设提示词截图" />
+          <img src={homePromptPreview} alt="SumAPI 提示词输入和预设提示词截图" />
         </div>
         <div className="home-showcase-copy">
           <span className="home-kicker">Prompt intelligence</span>
@@ -8275,7 +8267,7 @@ function SquarePage({
     }
     try {
       const response = await fetch("/api/square/quota", {
-        headers: { "x-imagehub-api-key": apiKey },
+        headers: { "x-sumapi-api-key": apiKey },
       });
       const payload = await readApiJson<SquareQuotaResponse>(response, "/api/square/quota");
       if (!response.ok || !payload.ok) throw payload;
@@ -8297,7 +8289,7 @@ function SquarePage({
       });
       if (!reset && cursor) query.set("cursor", cursor);
       const headers: Record<string, string> = {};
-      if (apiKeyReady) headers["x-imagehub-api-key"] = apiKey;
+      if (apiKeyReady) headers["x-sumapi-api-key"] = apiKey;
       const response = await fetch(`/api/square/feed?${query.toString()}`, { headers });
       const payload = await readApiJson<SquareFeedResponse>(response, "/api/square/feed");
       if (!response.ok || !payload.ok) throw payload;
@@ -8385,9 +8377,9 @@ function SquarePage({
       <header className="square-topbar">
         <button type="button" className="home-brand square-brand" onClick={onBackHome}>
           <span>
-            <img src={imageStudioLogo} alt="" />
+            <img src={sumapiLogo} alt="" />
           </span>
-          <strong>ImageHub Square</strong>
+          <strong>SumAPI Square</strong>
         </button>
         <div className="square-topbar-actions">
           <button type="button" className="subtle-button" onClick={onEnterStudio}>

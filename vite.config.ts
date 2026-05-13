@@ -1,4 +1,4 @@
-import react from "@vitejs/plugin-react";
+﻿import react from "@vitejs/plugin-react";
 import { Buffer } from "node:buffer";
 import {
   createHash,
@@ -10,7 +10,7 @@ import {
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
-import { defineConfig, type PluginOption, type ViteDevServer } from "vite";
+import { defineConfig, type PluginOption, type PreviewServer, type ViteDevServer } from "vite";
 
 type ImageProtocol =
   | "custom-openai"
@@ -264,14 +264,14 @@ const GPT_IMAGE_2_MODEL = "gpt-image-2";
 const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
 const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
 const GEMINI_NATIVE_API_PREFIX = "/v1beta";
-const ALLOWED_API_BASE_URLS = ["https://www.taijiai.online/", "https://bobdong.cn/"];
+const DEFAULT_API_BASE_URL = "https://api.clawopen.top/";
 const SESSION_COOKIE = "image_studio_admin_session";
 const SESSION_TTL_MS = 1000 * 60 * 60 * 8;
 const DATA_DIR = join(process.cwd(), ".data");
 const ADMIN_STORE_PATH = join(DATA_DIR, "admin-store.json");
 const SQUARE_STORE_PATH = join(DATA_DIR, "square-store.json");
 const REFERENCE_TEMP_TTL_MS = 1000 * 60 * 10;
-const PUBLIC_REFERENCE_BASE_URL = "https://imagehub.taijiai.online";
+const PUBLIC_REFERENCE_BASE_URL = "";
 const SQUARE_TIME_ZONE = "Asia/Shanghai";
 const SQUARE_SHELF_LIMIT = 4;
 const SQUARE_DAILY_RECOMMEND_LIMIT = 10;
@@ -719,17 +719,28 @@ function sanitizeForLog(value: unknown, key = "", depth = 0): unknown {
   return String(value);
 }
 
-function normalizeAllowedApiBaseUrl(value: string) {
-  const normalized = value.trim().replace(/\/+$/, "");
-  const match = ALLOWED_API_BASE_URLS.find((allowed) => allowed.replace(/\/+$/, "") === normalized);
-  if (!match) {
-    throw new Error("API URL 不在允许列表中");
+function normalizeApiBaseUrl(value: string) {
+  const normalized = value.trim();
+  if (!normalized) throw new Error("API URL 不能为空");
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    throw new Error("API URL 格式不正确");
   }
-  return match;
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error("API URL 仅支持 HTTP/HTTPS");
+  }
+  url.hash = "";
+  url.search = "";
+  return `${url.toString().replace(/\/+$/, "")}/`;
 }
 
-function isAllowedApiBaseUrlError(error: unknown) {
-  return error instanceof Error && error.message === "API URL 不在允许列表中";
+function isApiBaseUrlError(error: unknown) {
+  return error instanceof Error
+    && (error.message === "API URL 不能为空"
+      || error.message === "API URL 格式不正确"
+      || error.message === "API URL 仅支持 HTTP/HTTPS");
 }
 
 function httpStatusFromDetail(detail: unknown) {
@@ -1004,8 +1015,17 @@ function endpoint(baseUrl: string, path: string) {
   return `${cleanBase}${cleanPath}`;
 }
 
-function publicBaseUrlFromRequest(_req: IncomingMessage) {
-  return PUBLIC_REFERENCE_BASE_URL;
+function publicBaseUrlFromRequest(req: IncomingMessage) {
+  const configured = process.env.SUM_IMAGE_PUBLIC_BASE_URL?.trim() || PUBLIC_REFERENCE_BASE_URL;
+  if (isPublicReferenceBaseUrl(configured)) {
+    return configured.replace(/\/+$/, "");
+  }
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0]?.trim();
+  const forwardedHost = String(req.headers["x-forwarded-host"] || "").split(",")[0]?.trim();
+  const host = forwardedHost || String(req.headers.host || "").trim();
+  const protocol = forwardedProto || "http";
+  const inferred = host ? `${protocol}://${host}` : "";
+  return isPublicReferenceBaseUrl(inferred) ? inferred.replace(/\/+$/, "") : "";
 }
 
 function isPublicReferenceBaseUrl(value = "") {
@@ -2822,7 +2842,7 @@ async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
   const tab = normalizeSquareFeedTab(url.searchParams.get("tab"));
   const limit = Math.max(1, Math.min(SQUARE_MAX_FEED_LIMIT, Number(url.searchParams.get("limit")) || SQUARE_MAX_FEED_LIMIT));
   const offset = squareCursorOffset(url.searchParams.get("cursor"));
-  const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
+  const apiKey = String(req.headers["x-sumapi-api-key"] || "").trim();
   const viewerHash = apiKey ? hashApiKey(apiKey) : "";
   const store = readSquareStore();
   const sorted = sortSquareItems(squareActiveItems(store), tab);
@@ -2842,7 +2862,7 @@ async function handleSquareQuota(req: IncomingMessage, res: ServerResponse) {
     sendJson(res, 405, { ok: false, error: "Method not allowed" });
     return;
   }
-  const apiKey = String(req.headers["x-imagehub-api-key"] || "").trim();
+  const apiKey = String(req.headers["x-sumapi-api-key"] || "").trim();
   if (!apiKey) {
     sendJson(res, 401, { ok: false, error: "推荐和点赞需要先配置 API Key" });
     return;
@@ -3331,7 +3351,7 @@ async function handleSquareAdminExport(req: IncomingMessage, res: ServerResponse
     res.statusCode = 200;
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Cache-Control", "no-store");
-    res.setHeader("Content-Disposition", `attachment; filename="imagehub-square-audit-${dateKey}-${exportedAt.replace(/[:.]/g, "-")}.csv"`);
+    res.setHeader("Content-Disposition", `attachment; filename="sumapi-square-audit-${dateKey}-${exportedAt.replace(/[:.]/g, "-")}.csv"`);
     res.end(csv);
     appendAuditLog(auth.user.username, "admin_export_square_logs", `dateKey=${dateKey} format=csv count=${recommendLogs.length + likeLogs.length}`);
     return;
@@ -3358,15 +3378,12 @@ async function handleSquareAdminExport(req: IncomingMessage, res: ServerResponse
   res.statusCode = 200;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
   res.setHeader("Cache-Control", "no-store");
-  res.setHeader("Content-Disposition", `attachment; filename="imagehub-square-audit-${dateKey}-${exportedAt.replace(/[:.]/g, "-")}.json"`);
+  res.setHeader("Content-Disposition", `attachment; filename="sumapi-square-audit-${dateKey}-${exportedAt.replace(/[:.]/g, "-")}.json"`);
   res.end(JSON.stringify(payload, null, 2));
   appendAuditLog(auth.user.username, "admin_export_square_logs", `dateKey=${dateKey} format=json count=${recommendLogs.length + likeLogs.length}`);
 }
 
-function imageProxyPlugin(): PluginOption {
-  return {
-    name: "image-api-proxy",
-    configureServer(server: ViteDevServer) {
+function registerImageProxyMiddlewares(server: ViteDevServer | PreviewServer) {
       ensureAdminStore();
       ensureSquareStore();
       server.middlewares.use("/api/reference-images", (req, res) => {
@@ -3581,7 +3598,7 @@ function imageProxyPlugin(): PluginOption {
 
           if (path === "/logs/export" && req.method === "GET") {
             const exportedAt = new Date().toISOString();
-            const filename = `image-studio-logs-${exportedAt.replace(/[:.]/g, "-")}.json`;
+            const filename = `sumapi-logs-${exportedAt.replace(/[:.]/g, "-")}.json`;
             const payload = {
               exportedAt,
               exportedBy: user.username,
@@ -3623,7 +3640,7 @@ function imageProxyPlugin(): PluginOption {
         try {
           const body = await readJsonBody(req);
           const protocol = getProtocol(body.protocol);
-          const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl"));
+          const baseUrl = normalizeApiBaseUrl(getString(body, "baseUrl"));
           const apiKey = getString(body, "apiKey");
           if (!apiKey) {
             sendJson(res, 400, { ok: false, detail: { status: 400, error: "API Key 不能为空" } });
@@ -3634,7 +3651,7 @@ function imageProxyPlugin(): PluginOption {
         } catch (error) {
           const upstreamStatus = httpStatusFromDetail(error);
           const summary = safeErrorSummary(error);
-          const status = isAllowedApiBaseUrlError(error) ? 400 : upstreamStatus || 500;
+          const status = isApiBaseUrlError(error) ? 400 : upstreamStatus || 500;
           const isAuthError = status === 401 || status === 403;
           sendJson(res, status, {
             ok: false,
@@ -3679,7 +3696,7 @@ function imageProxyPlugin(): PluginOption {
 
         try {
           const body = await readJsonBody(req);
-          const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl"));
+          const baseUrl = normalizeApiBaseUrl(getString(body, "baseUrl"));
           const apiKey = getString(body, "apiKey");
           const protocol = getProtocol(body.protocol);
           const clientId = getString(body, "clientId") || "anonymous";
@@ -3760,7 +3777,7 @@ function imageProxyPlugin(): PluginOption {
           const detail = error && typeof error === "object" && "error" in error
             ? error
             : { error: error instanceof Error ? error.message : String(error) };
-          const status = isAllowedApiBaseUrlError(error) ? 400 : httpStatusFromDetail(detail) || httpStatusFromDetail(error) || 500;
+          const status = isApiBaseUrlError(error) ? 400 : httpStatusFromDetail(detail) || httpStatusFromDetail(error) || 500;
           if (logCreated) {
             const summary = safeErrorSummary(detail);
             const finishedAt = Date.now();
@@ -3818,7 +3835,7 @@ function imageProxyPlugin(): PluginOption {
 
         try {
           const body = await readJsonBody(req);
-          const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl") || ALLOWED_API_BASE_URLS[0]);
+          const baseUrl = normalizeApiBaseUrl(getString(body, "baseUrl") || DEFAULT_API_BASE_URL);
           const apiKey = getString(body, "apiKey");
           const protocol = getProtocol(body.protocol);
           const clientId = getString(body, "clientId") || "anonymous";
@@ -3929,7 +3946,7 @@ function imageProxyPlugin(): PluginOption {
           });
           res.end();
         } catch (error) {
-          const status = isAllowedApiBaseUrlError(error) ? 400 : httpStatusFromDetail(error) || 500;
+          const status = isApiBaseUrlError(error) ? 400 : httpStatusFromDetail(error) || 500;
           if (logCreated) {
             const summary = safeErrorSummary(error);
             const finishedAt = Date.now();
@@ -3974,7 +3991,7 @@ function imageProxyPlugin(): PluginOption {
         let logCreated = false;
         try {
           const body = await readJsonBody(req);
-          const baseUrl = normalizeAllowedApiBaseUrl(getString(body, "baseUrl"));
+          const baseUrl = normalizeApiBaseUrl(getString(body, "baseUrl"));
           const apiKey = getString(body, "apiKey");
           const publicBaseUrl = publicBaseUrlFromRequest(req);
           const request = (body.request && typeof body.request === "object" ? body.request : {}) as GenerateRequest;
@@ -4121,23 +4138,40 @@ function imageProxyPlugin(): PluginOption {
               durationMs: finishedAt - startedAt,
             });
           }
-          sendJson(res, isAllowedApiBaseUrlError(error) ? 400 : 500, { ok: false, requestId, detail: { error: message } });
+          sendJson(res, isApiBaseUrlError(error) ? 400 : 500, { ok: false, requestId, detail: { error: message } });
         }
       });
+}
+
+function imageProxyPlugin(): PluginOption {
+  return {
+    name: "image-api-proxy",
+    configureServer(server: ViteDevServer) {
+      registerImageProxyMiddlewares(server);
+    },
+    configurePreviewServer(server: PreviewServer) {
+      registerImageProxyMiddlewares(server);
     },
   };
 }
 
 function frontendVersionPlugin(): PluginOption {
+  const registerBuildVersion = (server: ViteDevServer | PreviewServer) => {
+    server.middlewares.use("/build-version.json", (_req, res) => {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, max-age=0, must-revalidate");
+      res.end(JSON.stringify(FRONTEND_BUILD_INFO));
+    });
+  };
+
   return {
     name: "frontend-build-version",
     configureServer(server: ViteDevServer) {
-      server.middlewares.use("/build-version.json", (_req, res) => {
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json; charset=utf-8");
-        res.setHeader("Cache-Control", "no-cache, max-age=0, must-revalidate");
-        res.end(JSON.stringify(FRONTEND_BUILD_INFO));
-      });
+      registerBuildVersion(server);
+    },
+    configurePreviewServer(server: PreviewServer) {
+      registerBuildVersion(server);
     },
     generateBundle() {
       this.emitFile({
