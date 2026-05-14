@@ -2823,7 +2823,7 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
     if (protocol === "google-imagen") {
       models = models.filter((model) => model.toLowerCase().includes("imagen"));
     }
-    return { models: [...new Set([...DEFAULT_MODELS[protocol], ...models])], raw: payload };
+    return { models: [...new Set(models)], raw: payload };
   }
 
   const path = protocol === "gemini-openai" ? "/models" : "/v1/models";
@@ -2834,7 +2834,7 @@ async function loadUpstreamModels(protocol: ImageProtocol, baseUrl: string, apiK
   if (!response.ok) throw detailFromUpstream(response.status, text);
   const payload = parseMaybeJson(text);
   const models = extractModelIds(payload, "data");
-  return { models: [...new Set([...DEFAULT_MODELS[protocol], ...models])], raw: payload };
+  return { models: [...new Set(models)], raw: payload };
 }
 
 async function handleSquareFeed(req: IncomingMessage, res: ServerResponse) {
