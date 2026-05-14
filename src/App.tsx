@@ -654,7 +654,6 @@ const DEFAULT_IMAGE_RESOLUTION: ImageResolution = "1K";
 const GPT_IMAGE_2_MODEL = "gpt-image-2";
 const GPT_IMAGE_2_FAMILY_MODEL = "gpt-5.4-image-2";
 const GEMINI_3_PRO_IMAGE_MODEL = "gemini-3-pro-image-preview";
-const PRIMARY_IMAGE_MODELS = [GPT_IMAGE_2_MODEL, GEMINI_3_PRO_IMAGE_MODEL] as const;
 const SUPPORTED_REFERENCE_TYPES = new Set(["image/png", "image/jpeg", "image/webp"]);
 
 const ASPECT_RATIOS = [
@@ -2638,10 +2637,10 @@ function preferModel(models: string[], current: string) {
 }
 
 function imageModelsForProtocol(protocol: ImageProtocol, upstreamModels: string[] = []) {
-  return filterAllowedImageModels([
-    ...upstreamModels,
-    ...getProtocolDefinition(protocol).defaultModels,
-  ]).filter((model) => protocolMatchesImageModel(protocol, model));
+  const candidates = upstreamModels.length > 0
+    ? upstreamModels
+    : getProtocolDefinition(protocol).defaultModels;
+  return filterAllowedImageModels(candidates).filter((model) => protocolMatchesImageModel(protocol, model));
 }
 
 function normalizedModelId(model: string) {
@@ -3239,10 +3238,12 @@ export default function App() {
   const composerConfigSummary = `${params.batchCount}张 · ${params.aspectRatio} · ${selectedResolution}`;
   const composerConfigDetail = `${resolvedRequestSize} · ${params.quality} · ${params.outputFormat.toUpperCase()} · 并发 ${params.concurrency}`;
 
-  const selectableImageModels = useMemo(
-    () => filterAllowedImageModels([...models, ...PRIMARY_IMAGE_MODELS]),
-    [models],
-  );
+  const selectableImageModels = useMemo(() => {
+    const candidates = isModelConnectionVerified
+      ? models
+      : getProtocolDefinition(apiConfig.protocol).defaultModels;
+    return filterAllowedImageModels(candidates).filter((model) => protocolMatchesImageModel(apiConfig.protocol, model));
+  }, [apiConfig.protocol, isModelConnectionVerified, models]);
   const filteredModels = useMemo(() => {
     const query = modelFilter.trim().toLowerCase();
     return selectableImageModels
